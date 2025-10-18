@@ -297,7 +297,7 @@ BM25_PARAMS = [
         help="BM25 k1 parameter (term frequency saturation)",
         category="bm25",
         applies_to=["bm25"],
-        optuna_suggest={'type': 'float', 'min': 0.5, 'max': 3.0, 'step': 0.1}
+        optuna_suggest={'type': 'float', 'min': 0.5, 'max': 3.0, 'step': 0.05}  # Finer granularity
     ),
     ParamDef(
         name="bm25_b",
@@ -307,7 +307,7 @@ BM25_PARAMS = [
         help="BM25 b parameter (document length normalization)",
         category="bm25",
         applies_to=["bm25"],
-        optuna_suggest={'type': 'float', 'min': 0.0, 'max': 1.0, 'step': 0.1}
+        optuna_suggest={'type': 'float', 'min': 0.0, 'max': 1.0, 'step': 0.05}  # Finer granularity
     ),
     ParamDef(
         name="bm25_method",
@@ -328,7 +328,7 @@ BM25_PARAMS = [
         help="BM25+ delta parameter (lower bound for term weights)",
         category="bm25",
         applies_to=["bm25"],
-        optuna_suggest={'type': 'float', 'min': 0.0, 'max': 2.0, 'step': 0.1}
+        optuna_suggest={'type': 'float', 'min': 0.0, 'max': 2.0, 'step': 0.05}  # Finer granularity
     ),
     ParamDef(
         name="bm25_stemmer",
@@ -445,7 +445,7 @@ STRATEGY_PARAMS = [
         help="Cumulative probability threshold for top_p strategy (0.0-1.0)",
         category="strategy",
         applies_to=["both"],
-        optuna_suggest={'type': 'float', 'min': 0.5, 'max': 0.99, 'step': 0.01}
+        optuna_suggest={'type': 'float', 'min': 0.5, 'max': 0.99}  # Continuous, no step
     ),
     ParamDef(
         name="relative_ratio",
@@ -455,7 +455,7 @@ STRATEGY_PARAMS = [
         help="Score ratio threshold for relative strategy (0.0-1.0)",
         category="strategy",
         applies_to=["both"],
-        optuna_suggest={'type': 'float', 'min': 0.5, 'max': 0.99, 'step': 0.01}
+        optuna_suggest={'type': 'float', 'min': 0.5, 'max': 0.99}  # Continuous, no step
     ),
 ]
 
