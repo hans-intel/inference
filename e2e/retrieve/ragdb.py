@@ -24,24 +24,18 @@ class RagDB(abc.ABC):
     
     def _determine_device(self, device: str) -> str:
         """Determine the best device to use."""
-        try:
-            import intel_extension_for_pytorch as ipex
-            import torch
-            XPU_AVAILABLE = torch.xpu.is_available() if hasattr(torch, 'xpu') else False
-        except ImportError:
-            import torch
-            XPU_AVAILABLE = False
+        import torch
         
         if device == "auto":
             if torch.hpu.is_available():
                 print("Using HPU device")
                 return "hpu"
-            elif XPU_AVAILABLE:
-                print("Using XPU device")
-                return "xpu"
             elif torch.cuda.is_available():
                 print("Using CUDA device")
                 return "cuda"
+            elif torch.xpu.is_available():
+                print("Using XPU device")
+                return "xpu"
             else:
                 print("Using CPU device")
                 return "cpu"
