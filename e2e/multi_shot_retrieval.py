@@ -92,7 +92,7 @@ def query_rewriter(question: str, new_documents: List[str],
                    reasoning_effort: str = "medium",
                    query_history: Optional[List[str]] = None,
                    query_results: Optional[List[int]] = None,
-                   previous_feedback: str = "",
+                   feedback_history: Optional[List[str]] = None,
                    llm_config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
     Evaluates documents AND generates new queries in one LLM call.
@@ -118,7 +118,7 @@ def query_rewriter(question: str, new_documents: List[str],
     kept_context = ""
     if kept_documents:
         for i, doc in enumerate(kept_documents, 1):
-            kept_context += f"\n[KEPT {i}] {doc[:300]}...\n"
+            kept_context += f"\n[KEPT {i}] {doc}...\n"
     else:
         kept_context = "None"
     
@@ -126,7 +126,7 @@ def query_rewriter(question: str, new_documents: List[str],
     new_context = ""
     if new_documents:
         for i, doc in enumerate(new_documents, 1):
-            new_context += f"\n[NEW {i}] {doc[:300]}...\n"
+            new_context += f"\n[NEW {i}] {doc}...\n"
     else:
         new_context = "None"
     
@@ -155,11 +155,15 @@ def query_rewriter(question: str, new_documents: List[str],
         history_text = "No queries yet"
     
     # Previous feedback - provide context about iteration number and previous failures
-    if previous_feedback and previous_feedback.strip() and previous_feedback != "None yet":
-        feedback_text = previous_feedback
+    if feedback_history and len(feedback_history) > 0:
+        feedback_text = "PREVIOUS FEEDBACKS: " + "\n".join(feedback_history)
     else:
         feedback_text = f"Iteration 1 - Initial search" if not query_history else f"Iteration {len(set(query_history)) + 1}"
     
+    print(f"   [DEBUG] context {context}")
+    print(f"   [DEBUG] history {history_text}")
+    print(f"   [DEBUG] feedback {feedback_text}")
+
     prompt = QUERY_REWRITER_PROMPT.format(
         question=question,
         context=context,
@@ -495,6 +499,7 @@ def multi_shot_retrieval(rag_db, original_query: str, expected_urls: List[str],
     all_retrieved_urls = set()
     iteration_times = []
     previous_feedback = ""  # Feedback from previous iteration
+    feedback_history = [] # Track all feedback to show progression
     
     sufficient = False
     iteration = 0
@@ -533,7 +538,7 @@ def multi_shot_retrieval(rag_db, original_query: str, expected_urls: List[str],
             reasoning_effort=reasoning_effort,
             query_history=query_history,
             query_results=query_results,
-            previous_feedback=previous_feedback,
+            feedback_history=feedback_history,
             llm_config=llm_config
         )
         
@@ -541,7 +546,7 @@ def multi_shot_retrieval(rag_db, original_query: str, expected_urls: List[str],
         sufficient = bool(result.get("answer", "").strip())
         relevance = result["relevance"]  # Only for NEW documents
         sub_queries = result["queries"]
-        previous_feedback = result["feedback"]
+        current_feedback = result["feedback"]
         final_answer = result.get("answer", "")
         reasoning_steps = result.get("reasoning", "")
         
@@ -555,9 +560,12 @@ def multi_shot_retrieval(rag_db, original_query: str, expected_urls: List[str],
             if reasoning_steps:
                 print(f"    Reasoning: {reasoning_steps[:300]}...")
             if not sufficient:
-                print(f"    Feedback: {previous_feedback}")
+                print(f"    Feedback: {current_feedback}")
                 print(f"    Generated {len(sub_queries)} new queries")
         
+        if current_feedback and current_feedback.strip():
+            feedback_history.append(current_feedback.strip())
+
         # Filter NEW documents by relevance and add to kept_docs
         if new_contents:
             for i, (url, content) in enumerate(new_docs):
