@@ -1,4 +1,5 @@
 import abc
+import os
 from typing import List, Dict, Any
 
 class RagDB(abc.ABC):
@@ -32,7 +33,13 @@ class RagDB(abc.ABC):
             XPU_AVAILABLE = False
         
         if device == "auto":
-            if XPU_AVAILABLE:
+            if torch.hpu.is_available():
+                print("Falling back to CPU for reranker as HPU is not supported.")
+                #print("Using HPU device for reranking")
+                #os.environ["PT_HPU_LAZY_MODE"] = "0"
+                #return "hpu"
+                return "cpu"
+            elif XPU_AVAILABLE:
                 print("Using XPU device for reranking")
                 return "xpu"
             elif torch.cuda.is_available():
@@ -66,6 +73,9 @@ class RagDB(abc.ABC):
         self._reranker_model = AutoModelForSequenceClassification.from_pretrained(self._reranker_model_name)
         self._reranker_tokenizer = AutoTokenizer.from_pretrained(self._reranker_model_name)
         
+        if self._device == "hpu":
+            print("Falling back to CPU for reranker as HPU is not supported.")
+            self._device = "cpu"
         self._reranker_model = self._reranker_model.to(self._device)
         self._reranker_model.eval()
     
