@@ -251,11 +251,13 @@ def call_passage_judge(
     max_output_tokens: int,
 ) -> Tuple[bool, str, str]:
     prompt_parts: List[str] = [
-        "You are helping debug a retrieval system.",
-        "Mark contains_hint=true whenever this passage directly supports the expected answer (even partially or phrased differently).",
-        "Only return contains_hint=false when the passage is clearly unrelated or purely redundant.",
+        "You are a strict retrieval judge.",
+        "Mark contains_hint=true ONLY if this passage provides a NEW concrete fact directly needed to answer the question.",
+        "A passage is relevant only if removing it would make the answer impossible to construct.",
+        "If similar information was already found in prior passages (shown in context), mark contains_hint=false.",
+        "Background context, lists without specific needed data, or vaguely related content should be marked contains_hint=false.",
+        "For lists/tables: only mark relevant if this passage contains the SPECIFIC entry needed (not just another row of the same list).",
         "Respond strictly with JSON: {\"contains_hint\": boolean, \"comment\": string}.",
-        "If the passage repeats prior evidence, explain the duplication but keep contains_hint=true if it still states the answer.",
         f"\nQuestion: {question}",
         f"\nExpected Answer: {answer}",
         f"\nIteration: {iteration}",
@@ -305,14 +307,17 @@ def call_iteration_judge(
     char_limit: int,
     prior_comments: Sequence[str],
     max_output_tokens: int,
-) -> Tuple[bool, str]:
+) -> Tuple[bool, str, List[Dict[str, object]]]:
     evidence = format_evidence(documents, char_limit)
     prompt_lines: List[str] = [
         "You assess whether the collected passages justify the answer.",
         "Provide a step-by-step logical flow explaining how the passages combine to produce the answer.",
-        "For each component of the answer, cite the specific passage (by URL and index) that provides it.",
+        "For each component of the answer, cite the specific passage using short format: [URL_short_name, idx=N].",
+        "Use concise URL names (e.g., 'Jane_Eyre' instead of full URL).",
+        "If can_answer=true, provide 'minimal_passages': the SMALLEST set of passages that, when combined following your logical flow, are sufficient to reconstruct the answer.",
+        "Each passage in minimal_passages must contribute a unique, essential fact; remove any redundant passages.",
         "If insufficient, explain exactly which missing fact prevents completion.",
-        "Respond with JSON: {can_answer: boolean, comment: string with step-by-step logical flow}.",
+        "Respond with JSON: {can_answer: boolean, comment: string with step-by-step flow using short names, minimal_passages: [list of {url_short: str, index: int}] if can_answer=true}.",
         f"\nIteration: {iteration}",
         f"\nQuestion: {question}",
         f"\nExpected Answer: {answer}",
@@ -340,10 +345,13 @@ def call_iteration_judge(
         comment = parsed.get("comment")
         if not isinstance(comment, str):
             comment = json.dumps(comment, ensure_ascii=False) if comment is not None else ""
+        # Extract minimal_passages if present and return separately
+        minimal_passages = parsed.get("minimal_passages", [])
     else:
         lowered = message.lower()
         can_answer = "cannot" not in lowered and "not" not in lowered
         comment = message
+        minimal_passages = []
     final_comment = (comment or message).strip()
     if not can_answer:
         final_comment = (
@@ -354,7 +362,7 @@ def call_iteration_judge(
         final_comment = (
             f"Iteration {iteration}: restate the reasoning with new phrasing and cite the specific passages that justify the answer."
         )
-    return can_answer, final_comment
+    return can_answer, final_comment, minimal_passages
 
 
 class RunState:
@@ -618,7 +626,7 @@ def process_question(
             doc = ensure_document(entry, url, passages_by_url)
             rel = len(doc.get("relevant_passages", []))
             logical_flow.append(f"After visiting {url}, found {rel} relevant passages.")
-        can_answer, judge_comment = call_iteration_judge(
+        can_answer, judge_comment, minimal_passages = call_iteration_judge(
             session,
             service_url,
             model,
@@ -637,18 +645,23 @@ def process_question(
 
         if can_answer:
             entry["complete"] = True
-            # --- LOGICAL FLOW FOR FINAL COMMENT ---
+            # Store minimal passages as a separate field
+            entry["minimal_passages"] = minimal_passages if minimal_passages else []
+            # --- LOGICAL FLOW FOR FINAL COMMENT WITH SHORT NAMES ---
             final_flow = []
             final_flow.append(f"Final logical flow for question {run_order}:")
             for it in entry["iterations"]:
-                final_flow.append(f"Iteration {it['iteration']}: {it['link_visit_reasoning']}")
-            final_flow.append(f"Relevant passages found: {entry['total_relevant_passages']}")
-            final_flow.append(f"Step-by-step reasoning: ")
+                final_flow.append(f"Iteration {it['iteration']}: {it['link_visit_reasoning'][:200]}")
+            final_flow.append(f"\nTotal relevant passages found: {entry['total_relevant_passages']}")
+            final_flow.append(f"\nStep-by-step reasoning:")
             for url in entry["links"]:
                 doc = ensure_document(entry, url, passages_by_url)
                 rels = doc.get("relevant_passages", [])
                 if rels:
-                    final_flow.append(f"From {url}: {len(rels)} relevant passages. Example: {rels[0]['comment'][:120]}")
+                    short_name = _short_url_name(url)
+                    indices = ", ".join(str(p['index']) for p in rels)
+                    final_flow.append(f"  - {short_name}: {len(rels)} passages (indices: {indices})")
+            final_flow.append(f"\nJudge analysis:")
             entry["final_comment"] = "\n".join(final_flow) + "\n" + judge_comment
             update_entry_totals(entry)
             state.save()
@@ -661,7 +674,7 @@ def process_question(
         update_entry_totals(entry)
         state.save()
         print(
-            f"Iteration {iteration} finished for question {run_order}/{total_questions}; judge comment: {judge_comment}",
+            f"Iteration {iteration} finished for question {run_order}/{total_questions}; judge comment: {judge_comment[:150]}...",
             flush=True,
         )
 
@@ -686,7 +699,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-questions", type=int, default=None, help="Optional limit on number of questions")
     parser.add_argument("--skip-questions", type=int, default=0, help="Number of questions to skip from the start")
     parser.add_argument("--resume", action="store_true", help="Reprocess questions even if already complete")
-    parser.add_argument("--include-context", action="store_true", help="Include found passages when judging new ones")
+    parser.add_argument("--include-context", action="store_true", default=True, help="Include found passages when judging new ones (default: True)")
+    parser.add_argument("--no-context", action="store_false", dest="include_context", help="Disable context inclusion")
     parser.add_argument("--context-limit", type=int, default=10, help="How many passages to include as context")
     parser.add_argument("--context-char-limit", type=int, default=DEFAULT_CONTEXT_LIMIT, help="Character limit per context passage")
     parser.add_argument("--judge-char-limit", type=int, default=DEFAULT_CONTEXT_LIMIT, help="Character limit per passage excerpt when asking judge")
@@ -734,9 +748,7 @@ def main() -> None:
             continue
 
         existing = state.ensure_question(dataset_index, processed + 1, question, answer, links)
-        if not args.resume and (existing.get("iterations") or existing.get("documents")):
-            state.reset_question(dataset_index)
-            existing = state.ensure_question(dataset_index, processed + 1, question, answer, links)
+        # Skip completed questions unless --resume is specified
         if existing.get("complete") and not args.resume:
             print(
                 f"Skipping completed question {existing.get('run_order')} (dataset idx {dataset_index})",
