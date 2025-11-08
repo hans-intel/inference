@@ -137,6 +137,92 @@ def build_context_snippets(
     return "\n\n".join(snippets[-max_entries:])
 
 
+def _short_url_name(url: str) -> str:
+    """Extract a short name from Wikipedia URL."""
+    if "wikipedia.org/wiki/" in url:
+        return url.split("/wiki/")[-1].replace("_", " ").replace("%C3%AB", "e")[:50]
+    return url[:50]
+
+
+def plan_link_visit_order(
+    session: requests.Session,
+    service_url: str,
+    model: str,
+    question: str,
+    answer: str,
+    links: Sequence[str],
+    iteration: int,
+    documents: Sequence[Dict[str, object]],
+    max_output_tokens: int,
+) -> Tuple[List[str], str]:
+    """Use LLM to strategically order wiki links based on the question."""
+    # Create short names for readability
+    link_map = {f"Link{i+1}({_short_url_name(url)})": url for i, url in enumerate(links)}
+    
+    if iteration == 1:
+        prompt = f"""You are a strategic retrieval planner.
+Given a multi-hop question and a list of Wikipedia URLs, decide the optimal order to visit them.
+Explain your reasoning concisely: which link provides the foundation, which builds on it, etc.
+Use the short link names (Link1, Link2, etc.) in your reasoning.
+
+Question: {question}
+Expected Answer: {answer}
+
+Available Wikipedia URLs:
+{chr(10).join(f"{name}: {url}" for name, url in link_map.items())}
+
+Respond with JSON: {{"ordered_urls": [list of full URLs in visit order], "reasoning": "concise step-by-step explanation using Link1, Link2, etc."}}"""
+    else:
+        progress = []
+        for doc in documents:
+            rel = len(doc.get("relevant_passages", []))
+            rem = len(doc.get("remaining_indices", []))
+            short = _short_url_name(doc['url'])
+            progress.append(f"{short}: {rel} relevant, {rem} remaining")
+        progress_str = "\n".join(progress)
+        prompt = f"""You are a strategic retrieval planner.
+Based on progress so far, decide the order to revisit Wikipedia URLs.
+Use short link names in your reasoning.
+
+Question: {question}
+Expected Answer: {answer}
+Iteration: {iteration}
+
+Progress so far:
+{progress_str}
+
+Respond with JSON: {{"ordered_urls": [list of full URLs in visit order], "reasoning": "concise explanation using short names"}}"""
+    
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "You plan optimal search strategies for multi-hop questions."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.0,
+        "max_tokens": max_output_tokens,
+    }
+    try:
+        response = session.post(service_url, json=payload, timeout=120)
+        response.raise_for_status()
+        message = response.json()["choices"][0]["message"]["content"].strip()
+        parsed = _extract_json(message)
+        if parsed and "ordered_urls" in parsed:
+            ordered = parsed["ordered_urls"]
+            reasoning = parsed.get("reasoning", "")
+            # Validate URLs are in the original list
+            valid_ordered = [url for url in ordered if url in links]
+            # Add any missing URLs at the end
+            for url in links:
+                if url not in valid_ordered:
+                    valid_ordered.append(url)
+            return valid_ordered, reasoning
+    except Exception:
+        pass
+    # Fallback: default order
+    return list(links), "Default order (planner failed)"
+
+
 def format_evidence(documents: Sequence[Dict[str, object]], char_limit: int) -> str:
     lines: List[str] = []
     for doc in documents:
@@ -222,9 +308,11 @@ def call_iteration_judge(
 ) -> Tuple[bool, str]:
     evidence = format_evidence(documents, char_limit)
     prompt_lines: List[str] = [
-        "You assess whether the collected passages already justify the answer.",
-        "Assume the full passage set is sufficient; if your previous judgement said otherwise, revise it using concrete citations.",
-        "Respond with JSON: {can_answer: boolean, comment: multi-sentence analysis}.",
+        "You assess whether the collected passages justify the answer.",
+        "Provide a step-by-step logical flow explaining how the passages combine to produce the answer.",
+        "For each component of the answer, cite the specific passage (by URL and index) that provides it.",
+        "If insufficient, explain exactly which missing fact prevents completion.",
+        "Respond with JSON: {can_answer: boolean, comment: string with step-by-step logical flow}.",
         f"\nIteration: {iteration}",
         f"\nQuestion: {question}",
         f"\nExpected Answer: {answer}",
@@ -425,21 +513,27 @@ def process_question(
             "new_relevant": 0,
             "can_answer": False,
             "comment": "",
+            "link_visit_order": [],
+            "link_visit_reasoning": "",
         }
         state.metadata["last_question_index"] = dataset_index
         state.metadata["last_question"] = question
         state.metadata["last_iteration"] = iteration
 
-        if iteration == 1:
-            ordered_links = list(links)
-        else:
-            ordered_links = sorted(
-                links,
-                key=lambda url: (
-                    len(ensure_document(entry, url, passages_by_url)["relevant_passages"]),
-                    len(ensure_document(entry, url, passages_by_url)["remaining_indices"]),
-                ),
-            )
+        # --- STRATEGIC LINK ORDERING VIA LLM PLANNER ---
+        ordered_links, reasoning = plan_link_visit_order(
+            session,
+            service_url,
+            model,
+            question,
+            answer,
+            links,
+            iteration,
+            entry.get("documents", []),
+            max_output_tokens,
+        )
+        iteration_record["link_visit_order"] = ordered_links
+        iteration_record["link_visit_reasoning"] = reasoning
 
         for link_idx, url in enumerate(ordered_links, start=1):
             doc = ensure_document(entry, url, passages_by_url)
@@ -514,7 +608,16 @@ def process_question(
 
         entry["last_iteration"] = iteration
 
+
         previous_iteration_comments = [it.get("comment", "") for it in entry.get("iterations", []) if it.get("comment")]
+        # --- LOGICAL FLOW FOR ITERATION COMMENT ---
+        logical_flow = []
+        logical_flow.append(f"Iteration {iteration}: Decided link visit order: {iteration_record['link_visit_order']}")
+        logical_flow.append(f"Reasoning: {iteration_record['link_visit_reasoning']}")
+        for url in iteration_record['link_visit_order']:
+            doc = ensure_document(entry, url, passages_by_url)
+            rel = len(doc.get("relevant_passages", []))
+            logical_flow.append(f"After visiting {url}, found {rel} relevant passages.")
         can_answer, judge_comment = call_iteration_judge(
             session,
             service_url,
@@ -529,12 +632,24 @@ def process_question(
         )
 
         iteration_record["can_answer"] = bool(can_answer)
-        iteration_record["comment"] = judge_comment
+        iteration_record["comment"] = "\n".join(logical_flow) + "\n" + judge_comment
         entry.setdefault("iterations", []).append(iteration_record)
 
         if can_answer:
             entry["complete"] = True
-            entry["final_comment"] = judge_comment
+            # --- LOGICAL FLOW FOR FINAL COMMENT ---
+            final_flow = []
+            final_flow.append(f"Final logical flow for question {run_order}:")
+            for it in entry["iterations"]:
+                final_flow.append(f"Iteration {it['iteration']}: {it['link_visit_reasoning']}")
+            final_flow.append(f"Relevant passages found: {entry['total_relevant_passages']}")
+            final_flow.append(f"Step-by-step reasoning: ")
+            for url in entry["links"]:
+                doc = ensure_document(entry, url, passages_by_url)
+                rels = doc.get("relevant_passages", [])
+                if rels:
+                    final_flow.append(f"From {url}: {len(rels)} relevant passages. Example: {rels[0]['comment'][:120]}")
+            entry["final_comment"] = "\n".join(final_flow) + "\n" + judge_comment
             update_entry_totals(entry)
             state.save()
             print(
@@ -569,6 +684,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--judge-model", default=DEFAULT_JUDGE_MODEL, help="LLM model identifier")
     parser.add_argument("--judge-max-output-tokens", type=int, default=1024, help="Maximum tokens for judge responses")
     parser.add_argument("--max-questions", type=int, default=None, help="Optional limit on number of questions")
+    parser.add_argument("--skip-questions", type=int, default=0, help="Number of questions to skip from the start")
     parser.add_argument("--resume", action="store_true", help="Reprocess questions even if already complete")
     parser.add_argument("--include-context", action="store_true", help="Include found passages when judging new ones")
     parser.add_argument("--context-limit", type=int, default=10, help="How many passages to include as context")
@@ -607,7 +723,11 @@ def main() -> None:
     state.save()
 
     processed = 0
+    skipped = 0
     for dataset_index, question, answer, links in dataset_rows:
+        if skipped < args.skip_questions:
+            skipped += 1
+            continue
         if args.max_questions is not None and processed >= args.max_questions:
             break
         if not question:
