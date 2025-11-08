@@ -311,6 +311,8 @@ def call_iteration_judge(
     evidence = format_evidence(documents, char_limit)
     prompt_lines: List[str] = [
         "You assess whether the collected passages justify the answer.",
+        "IMPORTANT: Only set can_answer=true if the passages explicitly contain ALL facts needed to derive the answer.",
+        "Do NOT rely on external knowledge or assumptions - every fact must be explicitly stated in the passages.",
         "Provide a step-by-step logical flow explaining how the passages combine to produce the answer.",
         "For each component of the answer, cite the specific passage using short format: [URL_short_name, idx=N].",
         "Use concise URL names (e.g., 'Jane_Eyre' instead of full URL).",
@@ -543,6 +545,9 @@ def process_question(
         iteration_record["link_visit_order"] = ordered_links
         iteration_record["link_visit_reasoning"] = reasoning
 
+        # Track early termination
+        can_answer_now = False
+        
         for link_idx, url in enumerate(ordered_links, start=1):
             doc = ensure_document(entry, url, passages_by_url)
             passages = passages_by_url.get(url, [])
@@ -600,6 +605,31 @@ def process_question(
                         }
                     )
                     iteration_record["new_relevant"] += 1
+                    
+                    # --- EARLY TERMINATION CHECK AFTER FINDING RELEVANT PASSAGE ---
+                    # Check if we can answer now with the passages collected so far
+                    update_entry_totals(entry)
+                    can_answer_now, temp_comment, temp_minimal = call_iteration_judge(
+                        session,
+                        service_url,
+                        model,
+                        question,
+                        answer,
+                        entry.get("documents", []),
+                        iteration,
+                        judge_char_limit,
+                        [it.get("comment", "") for it in entry.get("iterations", []) if it.get("comment")],
+                        max_output_tokens,
+                    )
+                    if can_answer_now:
+                        print(
+                            f"  Early termination: Can answer with {entry['total_relevant_passages']} passages!",
+                            flush=True,
+                        )
+                        # Exit passage loop and proceed to iteration judge
+                        remaining.clear()
+                        doc["remaining_indices"] = []
+                        break
 
                 update_entry_totals(entry)
                 hit_label = "hit" if contains else "miss"
@@ -613,6 +643,10 @@ def process_question(
                     print(f"  judge: {preview[:220]}", flush=True)
 
                 state.save()
+            
+            # Break out of link loop if early termination triggered
+            if not remaining and can_answer_now:
+                break
 
         entry["last_iteration"] = iteration
 
