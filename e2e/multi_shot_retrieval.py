@@ -38,36 +38,70 @@ from params import add_all_args
 import requests
 
 # Prompts
-QUERY_REWRITER_PROMPT = """You help plan the next search steps for answering a complex question.
+QUERY_REWRITER_PROMPT = """You are helping answer this multi-hop question by finding the right information step by step.
 
-QUESTION:
-{question}
+=== STRATEGY GUIDE ===
 
-RETRIEVED CONTEXT:
-{context}
+When you look at a multi-hop question, think about it like solving a puzzle:
 
-QUERY HISTORY:
-{history}
+1. IDENTIFY THE BUILDING BLOCKS
+   • What are the key entities mentioned? (names, places, dates, positions)
+   • What relationships connect them? ("mother of", "birthplace of", "authored by")
+   • What's the dependency chain? (find X first, then use X to find Y)
 
-FEEDBACK HISTORY:
-{feedback_history}
+2. CHECK WHAT YOU ALREADY HAVE
+   • Read through the documents carefully - the answer might already be there
+   • Look for specific names, dates, and facts that match the question
+   • If you have enough information to answer, provide the answer now
 
-INSTRUCTIONS:
-- Study the context to understand what facts are already known.
-- If the context already contains enough evidence to answer the question, set "answer" to the short final answer and leave "queries" empty.
-- Otherwise, propose up to {k} new search queries that move us closer to the answer. Each query must be distinct from everything in the history or prior feedback wording.
-- When previous approaches failed, change tactics—broaden scope, pivot to related entities, or ask for canonical pages—never repeat old patterns.
-- Provide concise "feedback" describing the remaining gap or next plan of attack.
+3. IDENTIFY THE NEXT MISSING PIECE
+   • What is the ONE specific fact you need next?
+   • Which entity or relationship are you targeting?
+   • Can this fact unlock other dependent facts?
+
+4. CRAFT A PRECISE SEARCH
+   Strategy selection:
+   ✓ For specific people/places/things: Use exact names + the attribute you need
+     Example: "James A. Garfield mother maiden name"
+   ✓ For positions in lists: Get the full ordered list first
+     Example: "list of US presidents chronological order 1-20"
+   ✓ For verification: Search the main Wikipedia page title
+     Example: "Abraham Lincoln assassination"
+   ✓ For connections: Combine both entities with their relationship
+     Example: "Charlotte Bronte Jane Eyre publication year"
+
+5. LEARN AND ADAPT
+   Study your search history above:
+   ✓ If a similar query already failed, try a completely different angle
+   ✓ If searches are too broad, add more specific constraints
+   ✓ If stuck on one path, pivot to find a different required fact first
+   ✓ Use exact Wikipedia page titles when you know the entity name
+
+CRITICAL SUCCESS PATTERNS:
+• Use specific entity names, not generic descriptions
+• Search for ONE clear fact per query
+• When you have facts, combine them to find the answer in documents
+• Try different but related search terms if first approach finds nothing new
+• Check if current documents already contain the answer before requesting more searches
 
 RESPONSE FORMAT (JSON ONLY):
 {{
-    "answer": "<short final answer or empty if unknown>",
-    "queries": ["<query1>", "<query2>", ...],
-    "feedback": "<what to do next or why we are stuck>",
-    "reasoning": "<optional brief chain of thought to justify the plan>"
+    "answer": "<final answer if you have enough information, otherwise empty string>",
+    "queries": ["<precise query 1>", "<precise query 2>", ...],
+    "feedback": "<what specific fact you're targeting and why>",
+    "reasoning": "<what you have, what's missing, how your new queries differ from previous attempts>"
 }}
+Return exactly this structure and nothing else.
 
-Return exactly this structure and nothing else."""
+QUESTION: {question}
+
+=== SEARCH HISTORY (Chronological) ===
+{history_chronological}
+
+=== CURRENT DOCUMENTS ===
+{context}
+
+"""
 
 
 def _uniform_clip_texts(texts: List[str], total_limit: int) -> List[str]:
@@ -83,21 +117,68 @@ def _uniform_clip_texts(texts: List[str], total_limit: int) -> List[str]:
     for idx, text in enumerate(texts):
         extra = 1 if idx < remainder else 0
         limit = per_doc + extra
-        if limit <= 0:
-            clipped.append("")
-        else:
-            clipped.append(text[:limit])
+        clipped.append(text[:max(limit, 0)])
     return clipped
 
 
-def query_rewriter(question: str, new_documents: List[tuple],
-                   kept_documents: List[tuple],
+
+def _format_documents_for_prompt(documents: List[Dict[str, Any]], total_char_limit: int) -> str:
+    if not documents:
+        return "(No new passages retrieved yet)"
+
+    texts = [doc.get("content", "") or "" for doc in documents]
+    clipped_texts = _uniform_clip_texts(texts, total_char_limit)
+    parts = ["CURRENT PASSAGES:"]
+
+    for idx, (doc, snippet) in enumerate(zip(documents, clipped_texts), 1):
+        url = doc.get("url") or doc.get("metadata", {}).get("base_filename", "Unknown source")
+        passage_index = doc.get("metadata", {}).get("index", -1)
+        header = f"[P{idx}] URL: {url}"
+        if passage_index is not None:
+            header += f" | Passage #{passage_index}"
+        parts.append(header)
+        parts.append(snippet.strip())
+        parts.append("")
+
+    return "\n".join(parts).strip()
+
+
+def _format_history_entries(history_entries: List[Dict[str, Any]]) -> str:
+    if not history_entries:
+        return "(No previous iterations yet)"
+
+    lines: List[str] = []
+    for entry in history_entries:
+        iteration = entry.get("iteration")
+        queries = entry.get("queries", [])
+        documents = entry.get("documents", [])
+        feedback = entry.get("feedback") or ""
+
+        lines.append(f"Iteration {iteration}:")
+        if queries:
+            for idx, query in enumerate(queries, 1):
+                lines.append(f"  Query {idx}: {query}")
+        else:
+            lines.append("  Queries: (none)")
+
+        if documents:
+            lines.append("  Passages: " + "; ".join(documents))
+        else:
+            lines.append("  Passages: (none)")
+
+        if feedback:
+            lines.append(f"  Feedback: {feedback}")
+
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
+
+def query_rewriter(question: str,
+                   documents: List[Dict[str, Any]],
+                   history_entries: Optional[List[Dict[str, Any]]] = None,
                    max_queries: int = 3,
                    reasoning_effort: str = "medium",
-                   query_history: Optional[List[str]] = None,
-                   query_results: Optional[List[int]] = None,
-                   previous_feedback: str = "",
-                   feedback_history: Optional[List[str]] = None,
                    llm_config: Optional[Dict[str, Any]] = None,
                    context_char_limit: int = 0) -> Dict[str, Any]:
     """
@@ -109,9 +190,8 @@ def query_rewriter(question: str, new_documents: List[tuple],
         kept_documents: List of KEPT document texts (already marked relevant)
         max_queries: Maximum number of new queries to generate
         reasoning_effort: LLM reasoning level
-        query_history: List of previous search queries
-        query_results: List of number of documents found for each query (parallel to query_history)
-        previous_feedback: Feedback from previous iteration about what's missing
+    documents: Passages retrieved in the most recent iteration
+    history_entries: Chronological list of previous iterations containing queries, docs, and feedback
         context_char_limit: Maximum characters to include per document snippet in the prompt
 
     Returns:
@@ -121,9 +201,8 @@ def query_rewriter(question: str, new_documents: List[tuple],
         - 'answer': final answer if sufficient, otherwise empty string
         - 'reasoning': optional short justification string
     """
-    combined_texts = [doc[1] or "" for doc in kept_documents] + [doc[1] or "" for doc in new_documents]
-
-    base_char_limit = context_char_limit if context_char_limit and context_char_limit > 0 else sum(len(text) for text in combined_texts)
+    history_entries = history_entries or []
+    base_char_limit = context_char_limit if context_char_limit and context_char_limit > 0 else sum(len(doc.get("content", "")) for doc in documents)
     attempt_limit = base_char_limit
     min_limit = max(512, attempt_limit // 4) if attempt_limit else 512
     retry_factor = 0.6
@@ -134,49 +213,21 @@ def query_rewriter(question: str, new_documents: List[tuple],
         model_name = llm_config["model_name"]
         service_url = llm_config["service_url"]
 
-    def build_sections(char_limit):
-        clipped_all = _uniform_clip_texts(combined_texts, char_limit)
-        kept_count = len(kept_documents)
-        kept_clipped = clipped_all[:kept_count]
-        new_clipped = clipped_all[kept_count:]
-
-        def format_block(label: str, docs: List[Tuple[str, str]], clipped: List[str]) -> str:
-            if not docs:
-                return f"{label}:\n  (none)"
-            parts = [f"{label}:"]
-            for idx, ((url, _), text) in enumerate(zip(docs, clipped), 1):
-                parts.append(f"[{label.split()[0]} {idx}] {url or 'Unknown source'}")
-                parts.append(text)
-            return "\n".join(parts)
-
-        return format_block("KEPT DOCUMENTS", kept_documents, kept_clipped), format_block("NEW DOCUMENTS", new_documents, new_clipped)
-
-    def format_history_block(items: List[str], label: str, max_items: int) -> str:
-        if not items:
-            return "(none)"
-        trimmed = items[-max_items:]
-        lines = [f"- {item}" for item in trimmed if item]
-        return "\n".join(lines) if lines else "(none)"
-
     last_error: Optional[Exception] = None
 
     for attempt in range(max_attempts):
-        kept_section, new_section = build_sections(attempt_limit)
-        context = f"{kept_section}\n\n{new_section}"
+        context = _format_documents_for_prompt(documents, attempt_limit)
+        history_text = _format_history_entries(history_entries)
 
-        history_text = format_history_block(query_history or [], "History", 10)
-        feedback_text = format_history_block(feedback_history or [], "Feedback", 5)
-
-        print(f"Context: {context}")
-        print(f"History: {history_text}")
-        print(f"Feedback: {feedback_text}")
+        if documents:
+            print(f"    Evaluating {len(documents)} passage(s) from previous iteration")
+        else:
+            print("    No passages to evaluate yet; generating initial queries")
 
         prompt = QUERY_REWRITER_PROMPT.format(
             question=question,
             context=context,
-            history=history_text,
-            feedback_history=feedback_text,
-            k=max_queries,
+            history_chronological=history_text,
         )
 
         payload = {
@@ -185,10 +236,12 @@ def query_rewriter(question: str, new_documents: List[tuple],
                 {
                     "role": "system",
                     "content": (
-                        "You are an expert at multi-hop reasoning and strategic search. "
-                        "CRITICAL: Never repeat failed queries. "
-                        "Always try meaningfully different queries, names, representations. "
-                        "Focus on atomic facts and progressive strategies."
+                        "You are a research expert helping solve multi-hop questions. "
+                        "Your strengths: (1) finding precise information quickly, "
+                        "(2) learning from search results to refine your approach, "
+                        "(3) using exact entity names and relationships, "
+                        "(4) knowing when you have enough information to answer. "
+                        "Focus on what works: specific queries, clear targets, adaptive strategy."
                     ),
                 },
                 {"role": "user", "content": prompt},
@@ -244,7 +297,7 @@ def query_rewriter(question: str, new_documents: List[tuple],
                 continue
             return {
                 "answer": "",
-                "queries": [question] if not query_history else [],
+                "queries": [question],
                 "feedback": f"API error: {http_err}",
                 "reasoning": "",
             }
@@ -252,7 +305,7 @@ def query_rewriter(question: str, new_documents: List[tuple],
             last_error = req_err
             return {
                 "answer": "",
-                "queries": [question] if not query_history else [],
+                "queries": [question],
                 "feedback": f"API error: {req_err}",
                 "reasoning": "",
             }
@@ -262,7 +315,7 @@ def query_rewriter(question: str, new_documents: List[tuple],
             print(f"LLM output: {llm_output[:200] if 'llm_output' in locals() else ''}")
             return {
                 "answer": "",
-                "queries": [question] if not query_history else [],
+                "queries": [question],
                 "feedback": f"JSON parse error: {json_err}",
                 "reasoning": "",
             }
@@ -272,7 +325,7 @@ def query_rewriter(question: str, new_documents: List[tuple],
             traceback.print_exc()
             return {
                 "answer": "",
-                "queries": [question] if not query_history else [],
+                "queries": [question],
                 "feedback": f"Unexpected error: {exc}",
                 "reasoning": "",
             }
@@ -282,167 +335,10 @@ def query_rewriter(question: str, new_documents: List[tuple],
 
     return {
         "answer": "",
-        "queries": [question] if not query_history else [],
+        "queries": [question],
         "feedback": "Failed to generate response",
         "reasoning": "",
     }
-
-
-def query_rewriter_llm(original_query: str, max_queries: int = 3, reasoning_effort: str = "medium",
-                       history: Optional[List[str]] = None, retrieved_docs: Optional[List[str]] = None,
-                       llm_config: Optional[Dict[str, Any]] = None) -> List[str]:
-    """
-    Use LLM to decompose a complex query into multiple sub-queries, or generate new queries
-    based on iterative feedback.
-    
-    Args:
-        original_query: The original complex query
-        max_queries: Maximum number of sub-queries to generate (default: 3)
-        reasoning_effort: LLM reasoning level (low/medium/high)
-        history: Optional list of previous search queries (for iterative mode)
-        retrieved_docs: Optional list of retrieved document texts (for iterative mode)
-        
-    Returns:
-        List of sub-queries
-    """
-    
-    # Determine if this is initial decomposition or iterative refinement
-    is_iterative = history is not None and retrieved_docs is not None
-    
-    if is_iterative:
-        # Iterative mode: Generate new queries based on what's been retrieved
-        history_text = "\n".join(f"- {q}" for q in history) if history else "None yet"
-        
-        results_text = ""
-        for i, doc in enumerate(retrieved_docs, 1):
-            results_text += f"\n[Document {i}]\n{doc[:300]}...\n"
-        
-        if not results_text:
-            results_text = "None yet"
-        
-        prompt = QUERY_REWRITER_ITERATIVE_PROMPT.format(
-            k=max_queries,
-            user_question=original_query,
-            history=history_text,
-            results=results_text
-        )
-        system_prompt = f"You are a helpful assistant that generates search queries."
-    else:
-        # Initial decomposition mode
-        system_prompt = f"""You are an expert at decomposing complex multi-hop questions into simpler sub-questions.
-
-Your task: Given a complex question, break it down into 1-{max_queries} simpler sub-questions that, when answered together, would help answer the original question.
-
-Guidelines:
-1. Identify the key facts/entities needed to answer the question
-2. Create sub-questions that retrieve each piece of information
-3. Order sub-questions logically (dependencies first)
-4. Keep sub-questions clear and specific
-5. If the question is already simple, return just the original question
-
-Output format: Return ONLY a JSON array of sub-questions, nothing else.
-Example: ["What year did X happen?", "Who won Y in that year?"]
-"""
-        prompt = f"""Original question: {original_query}
-
-Decompose this into at most {max_queries} sub-questions. Return only the JSON array."""
-
-    # Use LLM config if provided, otherwise use defaults
-    if llm_config:
-        model_name = llm_config["model_name"]
-        service_url = llm_config["service_url"]
-        max_tokens = llm_config.get("output_token_limit")
-
-    payload = {
-        "model": model_name,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": 0.1,
-        "max_tokens": max_tokens,
-        "reasoning_effort": reasoning_effort
-    }
-    
-    try:
-        response = requests.post(service_url, json=payload, timeout=60)
-        
-        if response.status_code != 200:
-            print(f"Error response: {response.text[:500]}")
-            print(f"Falling back to original query")
-            return [original_query]
-        
-        result = response.json()
-        
-        # Use only content field
-        message = result['choices'][0]['message']
-        llm_output = message.get('content')
-        
-        # For debugging: check if reasoning_content exists
-        reasoning_content = message.get('reasoning_content', '')
-        if reasoning_content and not llm_output:
-            print(f"DEBUG: reasoning_content exists but content is empty")
-            print(f"DEBUG: reasoning_content snippet: {reasoning_content[:200]}")
-        
-        if llm_output is None or not llm_output.strip():
-            print(f"Warning: LLM returned empty content for query rewriting")
-            return [original_query]
-        
-        llm_output = llm_output.strip()
-        
-        if not is_iterative:
-            print(f"LLM output: {llm_output[:200]}...")
-        
-        # Parse JSON output - handle markdown code blocks
-        if llm_output.startswith("```json"):
-            llm_output = llm_output.replace("```json", "").replace("```", "").strip()
-        elif llm_output.startswith("```"):
-            llm_output = llm_output.split("```")[1]
-            if llm_output.startswith("json"):
-                llm_output = llm_output[4:]
-            llm_output = llm_output.strip()
-        
-        sub_queries = json.loads(llm_output)
-        
-        # Validate output
-        if not isinstance(sub_queries, list):
-            print(f"Warning: LLM output is not a list, using original query")
-            return [original_query]
-        
-        # Limit to max_queries
-        sub_queries = sub_queries[:max_queries]
-        
-        # Ensure at least the original query is included if list is empty
-        if not sub_queries:
-            return [original_query]
-        
-        if not is_iterative:
-            print(f"\n{'='*80}")
-            print(f"QUERY DECOMPOSITION")
-            print(f"{'='*80}")
-            print(f"Original: {original_query}")
-            print(f"Sub-queries ({len(sub_queries)}):")
-            for i, sq in enumerate(sub_queries, 1):
-                print(f"  {i}. {sq}")
-            print(f"{'='*80}\n")
-        
-        return sub_queries
-        
-    except requests.exceptions.RequestException as e:
-        print(f"Error calling LLM service: {e}")
-        print(f"Falling back to original query")
-        return [original_query]
-    except json.JSONDecodeError as e:
-        print(f"Error parsing LLM output as JSON: {e}")
-        print(f"LLM output: {llm_output[:200]}")
-        print(f"Falling back to original query")
-        return [original_query]
-    except Exception as e:
-        print(f"Unexpected error in query rewriting: {e}")
-        import traceback
-        traceback.print_exc()
-        print(f"Falling back to original query")
-        return [original_query]
 
 
 def multi_shot_retrieval(rag_db, original_query: str, expected_urls: List[str],
@@ -489,15 +385,12 @@ def multi_shot_retrieval(rag_db, original_query: str, expected_urls: List[str],
     
     start_time = time.perf_counter()
     
-    # Track iteration history
-    query_history = []
-    query_results = []  # Track how many docs each query found
-    kept_docs: List[Tuple[str, str]] = []  # Accumulated (url, content) pairs
-    new_docs = []   # List of (url, content) tuples just retrieved this iteration
-    all_retrieved_urls = set()
+    kept_docs: List[Dict[str, Any]] = []  # Passages already reviewed by the LLM
+    pending_docs: List[Dict[str, Any]] = []  # Passages to review in the next iteration
+    iteration_history: List[Dict[str, Any]] = []
     iteration_times = []
-    previous_feedback = ""  # Feedback from previous iteration
-    feedback_history = []  # Track all feedback to show progression
+    total_query_count = 0
+    seen_passages: Set[Tuple[str, Any]] = set()
     
     sufficient = False
     iteration = 0
@@ -521,20 +414,16 @@ def multi_shot_retrieval(rag_db, original_query: str, expected_urls: List[str],
             print(f"ITERATION {iteration}/{max_iterations}")
             print(f"{'─'*80}")
         
-        # Step 1: Use combined function to grade NEW docs AND generate new queries
+        # Step 1: Evaluate most recent passages and decide next searches
         if verbose:
             print(f"\n  Evaluating documents and generating queries...")
-        
+
         result = query_rewriter(
-            original_query, 
-            new_documents=new_docs,
-            kept_documents=kept_docs,
+            original_query,
+            documents=pending_docs,
+            history_entries=iteration_history,
             max_queries=max_sub_queries,
             reasoning_effort=reasoning_effort,
-            query_history=query_history,
-            query_results=query_results,
-            previous_feedback=previous_feedback,
-            feedback_history=feedback_history,
             llm_config=llm_config,
             context_char_limit=context_char_limit
         )
@@ -546,35 +435,25 @@ def multi_shot_retrieval(rag_db, original_query: str, expected_urls: List[str],
         current_feedback = result.get("feedback", "")
         final_answer = answer_text
         reasoning_steps = result.get("reasoning", "")
-        
-        # Add to feedback history if it's new and meaningful
-        if current_feedback and current_feedback.strip() and current_feedback != previous_feedback:
-            feedback_history.append(current_feedback.strip())
-        
-        previous_feedback = current_feedback
+        total_query_count += len(sub_queries)
         
         if verbose:
             print(f"    Sufficient: {'yes' if sufficient else 'no'}")
-            print(f"    Kept docs: {len(kept_docs)}")
-            if new_docs:
-                print(f"    New docs available: {len(new_docs)}")
+            print(f"    Reviewed passages so far: {len(kept_docs)}")
+            if pending_docs:
+                print(f"    Pending passages: {len(pending_docs)}")
             if reasoning_steps:
                 print(f"    Reasoning: {reasoning_steps[:300]}...")
             if not sufficient:
-                print(f"    Feedback: {previous_feedback}")
+                print(f"    Feedback: {current_feedback}")
                 print(f"    Generated {len(sub_queries)} new queries")
         
-        # Keep all newly retrieved documents for future context
-        if new_docs:
-            for url, content in new_docs:
-                kept_docs.append((url, content))
-
+        # Move previously evaluated passages into the kept set
+        if pending_docs:
+            kept_docs.extend(pending_docs)
+            pending_docs = []
             if verbose:
-                print(f"    Added {len(new_docs)} docs to kept set")
-                print(f"    Total kept docs now: {len(kept_docs)}")
-        
-        # Clear new_docs for next iteration
-        new_docs = []
+                print(f"    Stored passages reviewed so far: {len(kept_docs)}")
         
         # If sufficient, we're done
         if sufficient:
@@ -592,28 +471,21 @@ def multi_shot_retrieval(rag_db, original_query: str, expected_urls: List[str],
             iteration_times.append(time.perf_counter() - iteration_start)
             break
         
-        if verbose:
+        if verbose and sub_queries:
             print(f"\n  New queries:")
             for i, q in enumerate(sub_queries, 1):
                 print(f"    {i}. {q}")
         
         # Step 2: Retrieve for each sub-query and track results
         num_sub_queries = len(sub_queries)
-        #docs_per_subquery = max(1, top_k_retriever // num_sub_queries)
         docs_per_subquery = max(1, top_k_retriever)
-        
-        iteration_results = []
-        per_query_counts = []  # Track new docs found by each query
-        
-        # Calculate target docs per subquery after reranking
-        #target_docs_per_subquery = max(5, top_k_retriever // num_sub_queries)
+        iteration_doc_descriptions: List[str] = []
         target_docs_per_subquery = top_k_retriever
+        retrieved_next_iter: List[Dict[str, Any]] = []
         
         for i, sub_query in enumerate(sub_queries, 1):
             if verbose:
                 print(f"\n  Retrieving for query {i}: {sub_query[:60]}...")
-            
-            query_start_count = len(new_docs)  # Track docs before this query
             
             # Retrieve
             if retrieval_strategy == "fixed_k":
@@ -647,29 +519,47 @@ def multi_shot_retrieval(rag_db, original_query: str, expected_urls: List[str],
                 # No reranking, just limit to target
                 results = results[:target_docs_per_subquery]
             
-            # Add to new_docs for evaluation (avoid duplicates)
+            new_passage_count = 0
             for result in results:
-                if 'original_url' in result.metadata and result.metadata['original_url']:
-                    url = result.metadata['original_url']
-                    if url not in all_retrieved_urls:
-                        all_retrieved_urls.add(url)
-                        new_docs.append((url, result.page_content))
-                        iteration_results.append(result)
-            
-            # Track how many NEW docs this query found
-            docs_found_by_query = len(new_docs) - query_start_count
-            per_query_counts.append(docs_found_by_query)
-            
+                metadata = result.metadata or {}
+                url = metadata.get('original_url') or metadata.get('base_filename')
+                passage_index = metadata.get('index')
+                passage_key = (url, passage_index)
+
+                if passage_key in seen_passages:
+                    continue
+                seen_passages.add(passage_key)
+
+                doc_record = {
+                    "url": url,
+                    "content": result.page_content,
+                    "metadata": metadata,
+                }
+                retrieved_next_iter.append(doc_record)
+
+                descriptor = f"{url or 'Unknown'} (idx {passage_index})"
+                iteration_doc_descriptions.append(descriptor)
+                new_passage_count += 1
+
             if verbose:
-                print(f"    Retrieved {len(results)} docs, {docs_found_by_query} new unique docs from this query")
-        
-        # Add queries and their results to history
-        for sub_query, count in zip(sub_queries, per_query_counts):
-            query_history.append(sub_query)
-            query_results.append(count)
-        
+                print(f"    Retrieved {len(results)} docs, {new_passage_count} new unique passages")
+
+        pending_docs = retrieved_next_iter
+
+        # Update iteration history for future LLM calls
+        iteration_history.append({
+            "iteration": iteration,
+            "queries": sub_queries,
+            "documents": iteration_doc_descriptions,
+            "feedback": (current_feedback or "").strip()
+        })
+
         if verbose:
-            print(f"  Total kept docs: {len(kept_docs)}, new docs to evaluate: {len(new_docs)}")
+            if iteration_doc_descriptions:
+                print("  New passages:")
+                for desc in iteration_doc_descriptions:
+                    print(f"      - {desc}")
+            print(f"  Total reviewed passages: {len(kept_docs)} | Pending: {len(pending_docs)}")
         
         iteration_time = time.perf_counter() - iteration_start
         iteration_times.append(iteration_time)
@@ -685,7 +575,8 @@ def multi_shot_retrieval(rag_db, original_query: str, expected_urls: List[str],
     # Extract URLs from kept_docs
     retrieved_urls: List[str] = []
     seen_urls: Set[str] = set()
-    for url, _ in kept_docs:
+    for doc in kept_docs:
+        url = doc.get("url")
         if url and url not in seen_urls:
             seen_urls.add(url)
             retrieved_urls.append(url)
@@ -702,7 +593,7 @@ def multi_shot_retrieval(rag_db, original_query: str, expected_urls: List[str],
     metrics.update({
         'total_time': total_time,
         'num_iterations': iteration,
-        'total_queries': len(query_history),
+        'total_queries': total_query_count,
         'final_docs_count': len(retrieved_urls),
         'sufficient': sufficient,
         'avg_iteration_time': sum(iteration_times) / len(iteration_times) if iteration_times else 0
@@ -718,25 +609,25 @@ def multi_shot_retrieval(rag_db, original_query: str, expected_urls: List[str],
         print(f"{'='*80}")
         print(f"Original Query: {original_query[:100]}...")
         print(f"Iterations: {iteration}")
-        print(f"Total queries issued: {len(query_history)}")
-        print(f"Sufficient: {'Yes' if sufficient else 'No'}")
-        if final_answer:
-            print(f"LLM Answer: {final_answer}")
-        if expected_answer:
-            print(f"Expected Answer: {expected_answer}")
-        print(f"Expected ({len(expected_set)}): {sorted(list(expected_set)[:5])}{'...' if len(expected_set) > 5 else ''}")
-        print(f"Retrieved ({len(retrieved_urls)} unique docs): {retrieved_urls[:5]}{'...' if len(retrieved_urls) > 5 else ''}")
-        matches = len(expected_set.intersection(set(retrieved_urls)))
-        print(f"Matches: {matches}")
-        print(f"\nMetrics:")
-        print(f"  P@N: {metrics.get('precision@N', 0.0):.3f}")
-        print(f"  R@N: {metrics.get('recall@N', 0.0):.3f}")
-        print(f"  F1@N: {metrics.get('f1@N', 0.0):.3f}")
-        print(f"  MAP: {metrics.get('average_precision', 0.0):.3f}")
-        print(f"\nTiming:")
-        print(f"  Avg per iteration: {metrics['avg_iteration_time']*1000:.1f}ms")
-        print(f"  Total: {total_time*1000:.1f}ms")
-        print(f"{'='*80}\n")
+    print(f"Total queries issued: {total_query_count}")
+    print(f"Sufficient: {'Yes' if sufficient else 'No'}")
+    if final_answer:
+        print(f"LLM Answer: {final_answer}")
+    if expected_answer:
+        print(f"Expected Answer: {expected_answer}")
+    print(f"Expected ({len(expected_set)}): {sorted(list(expected_set)[:5])}{'...' if len(expected_set) > 5 else ''}")
+    print(f"Retrieved ({len(retrieved_urls)} unique docs): {retrieved_urls[:5]}{'...' if len(retrieved_urls) > 5 else ''}")
+    matches = len(expected_set.intersection(set(retrieved_urls)))
+    print(f"Matches: {matches}")
+    print(f"\nMetrics:")
+    print(f"  P@N: {metrics.get('precision@N', 0.0):.3f}")
+    print(f"  R@N: {metrics.get('recall@N', 0.0):.3f}")
+    print(f"  F1@N: {metrics.get('f1@N', 0.0):.3f}")
+    print(f"  MAP: {metrics.get('average_precision', 0.0):.3f}")
+    print(f"\nTiming:")
+    print(f"  Avg per iteration: {metrics['avg_iteration_time']*1000:.1f}ms")
+    print(f"  Total: {total_time*1000:.1f}ms")
+    print(f"{'='*80}\n")
     
     return metrics
 
