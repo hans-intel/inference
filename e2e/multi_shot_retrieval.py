@@ -77,6 +77,11 @@ When you look at a multi-hop question, think about it like solving a puzzle:
    ✓ If stuck on one path, pivot to find a different required fact first
    ✓ Use exact Wikipedia page titles when you know the entity name
 
+6. RE-READ CURRENT PASSAGES BEFORE SEARCHING
+    • Study the CURRENT PASSAGES section and the query→passage pairs in history.
+    • If the answer (or the missing piece) is already present, explain it and stop searching.
+    • If only part of the info is present, state exactly what is missing before proposing searches.
+
 CRITICAL SUCCESS PATTERNS:
 • Use specific entity names, not generic descriptions
 • Search for ONE clear fact per query
