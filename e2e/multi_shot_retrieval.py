@@ -16,6 +16,7 @@ import argparse
 import json
 import time
 import os
+import re
 from typing import List, Dict, Any, Optional, Callable, Tuple, Set
 import pandas as pd
 
@@ -35,117 +36,156 @@ from utils import (
     is_token_limit_error,
 )
 from params import add_all_args
+from llm_answer import (
+    convert_results_to_entries,
+    generate_answer_from_entries,
+    uniform_clip_texts,
+)
+from prompt import QUERY_REWRITER_PROMPT
 import requests
 
-# Prompts
-QUERY_REWRITER_PROMPT = """You are helping answer this multi-hop question by finding the right information step by step.
 
-=== STRATEGY GUIDE ===
-
-When you look at a multi-hop question, think about it like solving a puzzle:
-
-1. IDENTIFY THE BUILDING BLOCKS
-   • What are the key entities mentioned? (names, places, dates, positions)
-   • What relationships connect them? ("mother of", "birthplace of", "authored by")
-   • What's the dependency chain? (find X first, then use X to find Y)
-
-2. CHECK WHAT YOU ALREADY HAVE
-   • Read through the documents carefully - the answer might already be there
-   • Look for specific names, dates, and facts that match the question
-   • If you have enough information to answer, provide the answer now
-
-3. IDENTIFY THE NEXT MISSING PIECE
-   • What is the ONE specific fact you need next?
-   • Which entity or relationship are you targeting?
-   • Can this fact unlock other dependent facts?
-
-4. CRAFT A PRECISE SEARCH
-   Strategy selection:
-   ✓ For specific people/places/things: Use exact names + the attribute you need
-     Example: "James A. Garfield mother maiden name"
-   ✓ For positions in lists: Get the full ordered list first
-     Example: "list of US presidents chronological order 1-20"
-   ✓ For verification: Search the main Wikipedia page title
-     Example: "Abraham Lincoln assassination"
-   ✓ For connections: Combine both entities with their relationship
-     Example: "Charlotte Bronte Jane Eyre publication year"
-
-5. LEARN AND ADAPT
-   Study your search history above:
-   ✓ If a similar query already failed, try a completely different angle
-   ✓ If searches are too broad, add more specific constraints
-   ✓ If stuck on one path, pivot to find a different required fact first
-   ✓ Use exact Wikipedia page titles when you know the entity name
-
-6. RE-READ CURRENT PASSAGES BEFORE SEARCHING
-    • Study the CURRENT PASSAGES section and the query→passage pairs in history.
-    • If the answer (or the missing piece) is already present, explain it and stop searching.
-    • If only part of the info is present, state exactly what is missing before proposing searches.
-
-CRITICAL SUCCESS PATTERNS:
-• Use specific entity names, not generic descriptions
-• Search for ONE clear fact per query
-• When you have facts, combine them to find the answer in documents
-• Try different but related search terms if first approach finds nothing new
-• Check if current documents already contain the answer before requesting more searches
-
-RESPONSE FORMAT (JSON ONLY):
-{{
-    "answer": "<final answer if you have enough information, otherwise empty string>",
-    "queries": ["<precise query 1>", "<precise query 2>", ...],
-    "feedback": "<what specific fact you're targeting and why>",
-    "reasoning": "<what you have, what's missing, how your new queries differ from previous attempts>"
-}}
-Return exactly this structure and nothing else.
-
-QUESTION: {question}
-
-=== SEARCH HISTORY (Chronological) ===
-{history_chronological}
-
-=== CURRENT DOCUMENTS ===
-{context}
-
-"""
+QUESTION_STOPWORDS = {
+    "the", "a", "an", "in", "on", "at", "of", "to", "for", "and", "or",
+    "if", "my", "your", "their", "our", "is", "are", "was", "were", "be",
+    "been", "have", "had", "has", "do", "does", "did", "with", "from", "by",
+    "who", "what", "when", "where", "why", "how", "which", "that", "this",
+    "these", "those", "same", "first", "second", "third", "fourth", "fifth",
+    "last", "latest", "year", "years", "as", "than", "into", "about",
+    "over", "under", "after", "before"
+}
 
 
-def _uniform_clip_texts(texts: List[str], total_limit: int) -> List[str]:
-    if total_limit is None or total_limit <= 0 or not texts:
-        return list(texts)
-    count = len(texts)
-    if count == 0:
+def _tokenize(text: str) -> List[str]:
+    if not text:
         return []
-    per_doc, remainder = divmod(total_limit, count)
-    if per_doc <= 0 and remainder == 0:
-        return [""] * count
-    clipped: List[str] = []
-    for idx, text in enumerate(texts):
-        extra = 1 if idx < remainder else 0
-        limit = per_doc + extra
-        clipped.append(text[:max(limit, 0)])
-    return clipped
+    return [token.lower() for token in re.findall(r"[A-Za-z0-9']+", text)]
 
 
+def _split_into_sentences(text: str) -> List[str]:
+    if not text:
+        return []
+    normalized = re.sub(r"\s+", " ", text).strip()
+    if not normalized:
+        return []
+    sentences = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9])", normalized)
+    return [s.strip() for s in sentences if s.strip()]
 
-def _format_documents_for_prompt(documents: List[Dict[str, Any]], total_char_limit: int) -> str:
+
+def _format_documents_for_prompt(
+    documents: List[Dict[str, Any]],
+    total_char_limit: Optional[int],
+) -> str:
     if not documents:
-        return "(No new passages retrieved yet)"
+        return "(No documents yet)"
 
-    texts = [doc.get("content", "") or "" for doc in documents]
-    clipped_texts = _uniform_clip_texts(texts, total_char_limit)
-    parts = ["CURRENT PASSAGES:"]
+    normalized_snippets: List[str] = []
+    sources: List[str] = []
 
-    for idx, (doc, snippet) in enumerate(zip(documents, clipped_texts), 1):
-        url = doc.get("url") or doc.get("metadata", {}).get("base_filename", "Unknown source")
-        passage_index = doc.get("metadata", {}).get("index", -1)
-        header = f"[P{idx}] URL: {url}"
-        if passage_index is not None:
-            header += f" | Passage #{passage_index}"
-        parts.append(header)
-        parts.append(snippet.strip())
-        parts.append("")
+    for doc in documents:
+        metadata = doc.get("metadata") or {}
+        source = (
+            doc.get("url")
+            or metadata.get("original_url")
+            or metadata.get("source")
+            or metadata.get("base_filename")
+            or "Unknown source"
+        )
+        text = doc.get("content") or doc.get("raw_content") or ""
+        text = re.sub(r"\s+", " ", text).strip()
+        normalized_snippets.append(text)
+        sources.append(source)
 
-    return "\n".join(parts).strip()
+    clip_limit = total_char_limit if total_char_limit and total_char_limit > 0 else None
+    clipped_snippets = uniform_clip_texts(normalized_snippets, clip_limit)
+
+    formatted_parts: List[str] = []
+    for idx, snippet in enumerate(clipped_snippets, 1):
+        source = sources[idx - 1] if idx - 1 < len(sources) else "Unknown source"
+        body = snippet.strip() if snippet else "(No content)"
+        formatted_parts.append(f"[P{idx}] Source: {source}\n{body}")
+
+    return "\n\n".join(formatted_parts)
+
+
+def _build_evidence_clips(
+    question: str,
+    documents: List[Dict[str, Any]],
+    max_sentences: int = 12,
+    per_doc_limit: int = 2,
+    total_char_limit: int = 4096,
+) -> str:
+    if not documents:
+        return "(No evidence clips yet)"
+
+    question_tokens = [t for t in _tokenize(question) if t not in QUESTION_STOPWORDS]
+    if not question_tokens:
+        question_tokens = _tokenize(question)
+
+    scored_sentences: List[Tuple[float, str, str]] = []
+    for idx, doc in enumerate(documents, 1):
+        label = f"P{idx}"
+        sentences = _split_into_sentences(doc.get("content", "") or "")
+        if not sentences:
+            continue
+        doc_scores: List[Tuple[float, str]] = []
+        for sentence in sentences:
+            tokens = _tokenize(sentence)
+            if not tokens:
+                continue
+            overlap = sum(1 for token in tokens if token in question_tokens)
+            if overlap == 0:
+                continue
+            score = overlap / len(tokens)
+            doc_scores.append((score, sentence))
+        doc_scores.sort(reverse=True, key=lambda x: x[0])
+        for score, sentence in doc_scores[:per_doc_limit]:
+            scored_sentences.append((score, label, sentence))
+
+    if not scored_sentences:
+        return "(No evidence clips yet)"
+
+    scored_sentences.sort(reverse=True, key=lambda x: x[0])
+    selected = scored_sentences[:max_sentences]
+
+    lines: List[str] = []
+    total_chars = 0
+    for _, label, sentence in selected:
+        snippet = f"{label}: {sentence.strip()}"
+        projected = total_chars + len(snippet) + 1
+        if total_char_limit and projected > total_char_limit:
+            break
+        lines.append(snippet)
+        total_chars = projected
+
+    if not lines:
+        return "(No evidence clips yet)"
+    return "\n".join(lines)
+
+def _answer_doc_limit(top_k_retriever: Optional[int], top_k_reranking: Optional[int]) -> Optional[int]:
+    if isinstance(top_k_reranking, int) and top_k_reranking > 0:
+        return top_k_reranking
+    if isinstance(top_k_retriever, int) and top_k_retriever > 0:
+        return top_k_retriever
+    return None
+
+
+def _attempt_single_shot_answer(
+    question: str,
+    documents: List[Dict[str, Any]],
+    llm_config: Optional[Dict[str, Any]],
+    context_char_limit: int,
+    doc_limit: Optional[int] = None,
+) -> str:
+    if not documents or not llm_config:
+        return ""
+    doc_entries = convert_results_to_entries(
+        documents,
+        limit=doc_limit,
+        context_char_limit=context_char_limit,
+    )
+    base_limit = llm_config.get("context_char_limit", context_char_limit)
+    return generate_answer_from_entries(question, doc_entries, llm_config, base_limit)
 
 
 def _format_history_entries(history_entries: List[Dict[str, Any]]) -> str:
@@ -177,6 +217,100 @@ def _format_history_entries(history_entries: List[Dict[str, Any]]) -> str:
         lines.append("")
 
     return "\n".join(lines).strip()
+
+
+def _retrieve_documents_for_queries(
+    sub_queries: List[str],
+    rag_db,
+    top_k_retriever: int,
+    no_rerank: bool,
+    retrieval_strategy: str,
+    strategy_params: Optional[Dict[str, Any]],
+    seen_passages: Set[Tuple[str, Any]],
+    verbose: bool = False,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Run retrieval for the provided queries and return unique passages plus descriptions."""
+    if not sub_queries:
+        return [], []
+
+    docs_per_subquery = max(1, top_k_retriever)
+    target_docs_per_subquery = top_k_retriever
+    iteration_doc_descriptions: List[str] = []
+    retrieved_docs: List[Dict[str, Any]] = []
+
+    for i, sub_query in enumerate(sub_queries, 1):
+        if verbose:
+            print(f"\n  Retrieving for query {i}: {sub_query[:60]}...")
+
+        if retrieval_strategy == "fixed_k":
+            results = rag_db.lookup(sub_query, k=docs_per_subquery)
+        else:
+            from retrieve.filter import filter as adaptive_filter
+
+            params_copy = dict(strategy_params or {})
+            original_max_results = params_copy.get("max_results", 20)
+            params_copy["max_results"] = max(1, original_max_results)
+            results = adaptive_filter(
+                rag_db,
+                sub_query,
+                method=retrieval_strategy,
+                **params_copy,
+            )
+
+        if not no_rerank and results:
+            if verbose:
+                print(
+                    f"    Reranking {len(results)} docs for this subquery to top {target_docs_per_subquery}..."
+                )
+
+            contents = [r.page_content for r in results]
+            scored_passages = rag_db.rerank(sub_query, contents)
+            reranked_results: List[Dict[str, Any]] = []
+            used_indices: Set[int] = set()
+            for passage, _ in scored_passages:
+                for idx, doc in enumerate(results):
+                    if idx in used_indices:
+                        continue
+                    if doc.page_content == passage:
+                        reranked_results.append(doc)
+                        used_indices.add(idx)
+                        break
+
+            if reranked_results:
+                results = reranked_results
+
+            if verbose:
+                print(f"    After reranking: keeping top {len(results)} docs")
+
+        if len(results) > target_docs_per_subquery:
+            results = results[:target_docs_per_subquery]
+
+        new_passage_count = 0
+        for result in results:
+            metadata = result.metadata or {}
+            url = metadata.get('original_url') or metadata.get('base_filename')
+            passage_index = metadata.get('index')
+            passage_key = (url, passage_index)
+
+            if passage_key in seen_passages:
+                continue
+            seen_passages.add(passage_key)
+
+            doc_record = {
+                "url": url,
+                "content": result.page_content,
+                "metadata": metadata,
+            }
+            retrieved_docs.append(doc_record)
+
+            descriptor = f"{url or 'Unknown'} (idx {passage_index})"
+            iteration_doc_descriptions.append(descriptor)
+            new_passage_count += 1
+
+        if verbose:
+            print(f"    Retrieved {len(results)} docs, {new_passage_count} new unique passages")
+
+    return retrieved_docs, iteration_doc_descriptions
 
 
 def query_rewriter(question: str,
@@ -223,6 +357,11 @@ def query_rewriter(question: str,
     for attempt in range(max_attempts):
         context = _format_documents_for_prompt(documents, attempt_limit)
         history_text = _format_history_entries(history_entries)
+        evidence_clips = _build_evidence_clips(
+            question,
+            documents,
+            total_char_limit=attempt_limit if attempt_limit else 4096,
+        )
 
         if documents:
             print(f"    Evaluating {len(documents)} passage(s) from previous iteration")
@@ -233,6 +372,7 @@ def query_rewriter(question: str,
             question=question,
             context=context,
             history_chronological=history_text,
+            evidence_clips=evidence_clips,
         )
 
         payload = {
@@ -410,7 +550,100 @@ def multi_shot_retrieval(rag_db, original_query: str, expected_urls: List[str],
         print(f"Max sub-queries per iteration: {max_sub_queries}")
         print(f"{'='*80}\n")
     
-    while not sufficient and iteration < max_iterations:
+    original_query_clean = (original_query or "").strip()
+    pending_single_shot = False
+    answer_doc_limit = _answer_doc_limit(top_k_retriever, top_k_reranking)
+    if original_query_clean:
+        baseline_docs, initial_doc_descriptions = _retrieve_documents_for_queries(
+            [original_query_clean],
+            rag_db,
+            top_k_retriever,
+            no_rerank,
+            retrieval_strategy,
+            strategy_params,
+            seen_passages,
+            verbose,
+        )
+        pending_docs.extend(baseline_docs)
+        total_query_count += 1
+
+        history_feedback = "Initial retrieval using original question"
+        iteration_history.append({
+            "iteration": 0,
+            "queries": [original_query_clean],
+            "documents": initial_doc_descriptions,
+            "feedback": history_feedback,
+        })
+
+        pending_single_shot = bool(pending_docs and llm_config)
+
+    while not sufficient and (iteration < max_iterations or pending_single_shot):
+        if pending_single_shot:
+            if verbose:
+                print(f"\n{'─'*80}")
+                print("BASELINE SINGLE-SHOT EVALUATION")
+                print(f"{'─'*80}")
+
+            try:
+                baseline_doc_limit = answer_doc_limit or len(pending_docs)
+                if baseline_doc_limit:
+                    baseline_doc_limit = min(baseline_doc_limit, len(pending_docs))
+                else:
+                    baseline_doc_limit = len(pending_docs)
+                if verbose:
+                    print(f"    Using top {baseline_doc_limit} document(s) for baseline answer")
+                    for idx, doc in enumerate(pending_docs[:baseline_doc_limit], 1):
+                        metadata = doc.get("metadata") or {}
+                        url = doc.get("url") or metadata.get("original_url") or metadata.get("source") or metadata.get("base_filename")
+                        passage_index = metadata.get("index")
+                        print(f"      [{idx}] URL: {url} | Passage #{passage_index}")
+                baseline_answer = _attempt_single_shot_answer(
+                    original_query,
+                    pending_docs,
+                    llm_config,
+                    context_char_limit,
+                    doc_limit=baseline_doc_limit,
+                )
+                if verbose:
+                    preview = baseline_answer.strip() if isinstance(baseline_answer, str) else str(baseline_answer)
+                    print(f"    Baseline answer preview: {preview[:200] if preview else '(empty)'}")
+            except Exception as exc:
+                baseline_answer = ""
+                if verbose:
+                    print(f"    Baseline answer attempt failed: {exc}")
+
+            note = "Single-shot answer: " + (baseline_answer.strip() or "(empty)")
+            if iteration_history:
+                existing_feedback = iteration_history[-1].get("feedback", "")
+                iteration_history[-1]["feedback"] = (
+                    f"{existing_feedback} | {note}" if existing_feedback else note
+                )
+
+            pending_single_shot = False
+
+            baseline_clean = ""
+            if isinstance(baseline_answer, str):
+                baseline_clean = baseline_answer.strip()
+            elif baseline_answer is not None:
+                baseline_clean = str(baseline_answer).strip()
+            normalized_baseline = baseline_clean.lower()
+
+            if baseline_clean and normalized_baseline != "unknown":
+                final_answer = baseline_clean
+                sufficient = True
+                kept_docs.extend(pending_docs)
+                pending_docs = []
+                if verbose:
+                    print("    Single-shot answer deemed sufficient. Skipping iterative refinement.")
+                break
+
+            if verbose:
+                print("    Single-shot attempt insufficient; starting iterative refinement.")
+            continue
+
+        if iteration >= max_iterations:
+            break
+
         iteration += 1
         iteration_start = time.perf_counter()
         
@@ -482,73 +715,16 @@ def multi_shot_retrieval(rag_db, original_query: str, expected_urls: List[str],
                 print(f"    {i}. {q}")
         
         # Step 2: Retrieve for each sub-query and track results
-        num_sub_queries = len(sub_queries)
-        docs_per_subquery = max(1, top_k_retriever)
-        iteration_doc_descriptions: List[str] = []
-        target_docs_per_subquery = top_k_retriever
-        retrieved_next_iter: List[Dict[str, Any]] = []
-        
-        for i, sub_query in enumerate(sub_queries, 1):
-            if verbose:
-                print(f"\n  Retrieving for query {i}: {sub_query[:60]}...")
-            
-            # Retrieve
-            if retrieval_strategy == "fixed_k":
-                results = rag_db.lookup(sub_query, k=docs_per_subquery)
-            else:
-                from retrieve.filter import filter
-                original_max_results = strategy_params.get("max_results", 20)
-                #adjusted_max_results = max(1, original_max_results // num_sub_queries)
-                adjusted_max_results = max(1, original_max_results)
-                strategy_params_copy = strategy_params.copy()
-                strategy_params_copy["max_results"] = adjusted_max_results
-                results = filter(rag_db, sub_query, method=retrieval_strategy, **strategy_params_copy)
-            
-            # Apply per-subquery reranking if enabled
-            if not no_rerank and len(results) > target_docs_per_subquery:
-                if verbose:
-                    print(f"    Reranking {len(results)} docs for this subquery to top {target_docs_per_subquery}...")
-                
-                # Extract contents for reranking
-                contents = [r.page_content for r in results]
-                scored_passages = rag_db.rerank(sub_query, contents)
-                
-                # Reorder results by reranking scores and take top-k
-                reranked_indices = [i for i, _ in sorted(enumerate(scored_passages), 
-                                                         key=lambda x: x[1][1], reverse=True)]
-                results = [results[idx] for idx in reranked_indices[:target_docs_per_subquery]]
-                
-                if verbose:
-                    print(f"    After reranking: keeping top {len(results)} docs")
-            elif len(results) > target_docs_per_subquery:
-                # No reranking, just limit to target
-                results = results[:target_docs_per_subquery]
-            
-            new_passage_count = 0
-            for result in results:
-                metadata = result.metadata or {}
-                url = metadata.get('original_url') or metadata.get('base_filename')
-                passage_index = metadata.get('index')
-                passage_key = (url, passage_index)
-
-                if passage_key in seen_passages:
-                    continue
-                seen_passages.add(passage_key)
-
-                doc_record = {
-                    "url": url,
-                    "content": result.page_content,
-                    "metadata": metadata,
-                }
-                retrieved_next_iter.append(doc_record)
-
-                descriptor = f"{url or 'Unknown'} (idx {passage_index})"
-                iteration_doc_descriptions.append(descriptor)
-                new_passage_count += 1
-
-            if verbose:
-                print(f"    Retrieved {len(results)} docs, {new_passage_count} new unique passages")
-
+        retrieved_next_iter, iteration_doc_descriptions = _retrieve_documents_for_queries(
+            sub_queries,
+            rag_db,
+            top_k_retriever,
+            no_rerank,
+            retrieval_strategy,
+            strategy_params,
+            seen_passages,
+            verbose,
+        )
         pending_docs = retrieved_next_iter
 
         # Update iteration history for future LLM calls
@@ -575,6 +751,10 @@ def multi_shot_retrieval(rag_db, original_query: str, expected_urls: List[str],
             break
     
     # Final processing
+    if pending_docs:
+        kept_docs.extend(pending_docs)
+        pending_docs = []
+
     total_time = time.perf_counter() - start_time
     
     # Extract URLs from kept_docs
