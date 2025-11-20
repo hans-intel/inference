@@ -204,6 +204,7 @@ def generate_answer_from_entries(
     output_token_limit = llm_config.get("output_token_limit")
     service_url = llm_config.get("service_url")
     model_name = llm_config.get("model_name")
+    request_timeout = llm_config.get("request_timeout", 600)
 
     attempt_limit = base_char_limit
     min_limit = max(256, attempt_limit // 4) if attempt_limit else 256
@@ -226,7 +227,7 @@ def generate_answer_from_entries(
         }
 
         try:
-            response = requests.post(service_url, json=payload, timeout=60)
+            response = requests.post(service_url, json=payload, timeout=request_timeout)
             print(response)
             response.raise_for_status()
             data = response.json()

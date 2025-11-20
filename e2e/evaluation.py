@@ -10,10 +10,15 @@ This module provides comprehensive retrieval evaluation metrics including:
 Designed for reuse across different retrieval systems including multi-hop QA.
 """
 
-import pandas as pd
-from typing import List, Dict, Any, Optional, Tuple, Union, Callable
+import concurrent.futures
+import contextlib
+import io
 from collections import defaultdict
-from utils import filter_dataset_by_difficulty
+from typing import List, Dict, Any, Optional, Tuple, Union, Callable
+
+import pandas as pd
+
+from utils import filter_dataset_by_difficulty, print_evaluation_summary
 
 
 def calculate_retrieval_metrics(expected_urls: List[str], retrieved_urls: List[str], k_values: List[int] = [1, 3, 5, 10]) -> Dict[str, float]:
@@ -252,21 +257,22 @@ def evaluate_retrieval_query(rag_db, query: str, expected_urls: List[str],
     return merged_metrics
 
 
-def run_evaluation(rag_db, dataset_path: str, 
-                               top_k_retriever: int = 50, top_k_reranking: int = 10, 
-                               max_queries: Optional[int] = None, no_rerank: bool = False,
-                               retrieval_strategy: str = "fixed_k", detailed_analysis: bool = False,
-                               difficulty: int = 0, collect_results: bool = False,
-                               result_handler: Optional[Callable[[str, List[Any], Dict[str, Any]], Optional[Any]]] = None,
-                               **strategy_params) -> Union[Dict[str, float], Tuple[Dict[str, float], List[Dict[str, Any]]]]:
+def run_evaluation(rag_db, dataset_path: str,
+                   top_k_retriever: int = 50, top_k_reranking: int = 10,
+                   max_queries: Optional[int] = None, no_rerank: bool = False,
+                   retrieval_strategy: str = "fixed_k", detailed_analysis: bool = False,
+                   difficulty: int = 0, collect_results: bool = False,
+                   result_handler: Optional[Callable[[str, List[Any], Dict[str, Any]], Optional[Any]]] = None,
+                   llm_batch_size: int = 64,
+                   **strategy_params) -> Union[Dict[str, float], Tuple[Dict[str, float], List[Dict[str, Any]]]]:
     """
     Run comprehensive evaluation on a dataset with detailed metrics reporting.
-    
+
     Args:
         rag_db: RAG database instance
         dataset_path: Path to the dataset TSV file
         top_k_retriever: Number of documents to retrieve initially
-        top_k_reranking: Number of documents after reranking  
+        top_k_reranking: Number of documents after reranking
         max_queries: Maximum number of queries to evaluate (None = all)
         no_rerank: Skip reranking step for fair comparison between retrieval methods
         retrieval_strategy: Strategy for retrieval ("fixed_k", "top_p", "relative")
@@ -274,198 +280,221 @@ def run_evaluation(rag_db, dataset_path: str,
         difficulty: Minimum number of answer links required (0 = no filtering)
         collect_results: If True, also collect retrieval outputs for each query
         result_handler: Optional callback invoked per query with (prompt, retrieved_docs, metrics)
+        llm_batch_size: Maximum number of questions to process in parallel
         **strategy_params: Parameters for adaptive retrieval strategies
-        
+
     Returns:
         Dictionary of averaged metrics across all queries. When collect_results=True, returns a tuple of (metrics_dict, collected_results).
     """
     df = pd.read_csv(dataset_path, sep='\t')
-    
-    # Filter by difficulty if specified
     df = filter_dataset_by_difficulty(df, difficulty)
-    
-    # Limit number of queries if specified
+
     if isinstance(max_queries, int) and max_queries > 0:
-        df = df.head(max_queries)
+        df = df.head(max_queries).reset_index(drop=True)
     else:
         max_queries = len(df)
+        df = df.reset_index(drop=True)
 
     print(f"\nRunning evaluation on {max_queries} queries from dataset")
-    
-    # Aggregate metrics collection
-    total_metrics = {}
-    all_query_metrics = []  # Store individual query metrics for detailed analysis
-    retrieval_times = []
-    reranking_times = []
-    total_times = []
-    docs_per_sec_list = []
-    collected_queries = [] if collect_results else None
-    valid_queries = 0
-    
+
+    records = []
     for idx, row in df.iterrows():
-        # Extract expected Wikipedia links
         expected_urls = []
         for col in df.columns:
             if col.startswith('wikipedia_link_') and pd.notna(row[col]):
                 expected_urls.append(row[col].strip())
-        
         if expected_urls:
-            # Get comprehensive metrics for this query
-            need_results = collect_results or (result_handler is not None)
-            metrics_output = evaluate_retrieval_query(
-                rag_db, row['Prompt'], expected_urls, 
-                top_k_retriever, top_k_reranking, verbose=True, no_rerank=no_rerank,
-                retrieval_strategy=retrieval_strategy, return_results=need_results,
-                **strategy_params
-            )
-            if need_results:
-                metrics, retrieved_docs = metrics_output
-            else:
-                metrics = metrics_output
-                retrieved_docs = []
+            records.append({
+                "prompt": row['Prompt'],
+                "expected_urls": expected_urls,
+                "row_index": idx,
+            })
 
-            if collect_results and retrieved_docs:
-                doc_entries = []
-                seen_urls = set()
-                for doc in retrieved_docs:
-                    url = None
-                    if hasattr(doc, 'metadata'):
-                        url = doc.metadata.get('original_url') or doc.metadata.get('source')
-                        content = doc.page_content
-                    elif isinstance(doc, dict):
-                        url = doc.get('url')
-                        content = doc.get('content', "")
-                    else:
-                        content = ""
-                    if url and url in seen_urls:
-                        continue
-                    entry = {
-                        "url": url,
-                        "content": content[:2000]
-                    }
-                    doc_entries.append(entry)
-                    if url:
-                        seen_urls.add(url)
-                collected_queries.append({
-                    "prompt": row['Prompt'],
-                    "docs": doc_entries
-                })
-
-            if result_handler:
-                result_handler(row['Prompt'], retrieved_docs, metrics)
-            
-            # Store metrics for detailed analysis if requested
-            if detailed_analysis:
-                all_query_metrics.append(metrics)
-            
-            # Collect retrieval performance metrics for statistics
-            if 'retrieval_time' in metrics:
-                retrieval_times.append(metrics['retrieval_time'])
-                reranking_times.append(metrics['reranking_time'])
-                total_times.append(metrics['total_retrieval_time'])
-                docs_per_sec_list.append(metrics['docs_per_second'])
-            
-            # Accumulate metrics
-            for metric_name, value in metrics.items():
-                if metric_name not in total_metrics:
-                    total_metrics[metric_name] = 0.0
-                total_metrics[metric_name] += value
-            
-            valid_queries += 1
-    
-    if valid_queries > 0:
-        # Calculate average metrics
-        avg_metrics = {name: total / valid_queries for name, total in total_metrics.items()}
-        
-        # Display results
-        results_title = "OVERALL EVALUATION RESULTS" if detailed_analysis else "EVALUATION RESULTS"
-        print(f"\n" + "="*60)
-        print(f"{results_title} ({valid_queries} queries)")
-        print(f"="*60)
-        print(f"PRECISION METRICS:")
-        print(f"  Precision@N:                {avg_metrics.get('precision@N', 0.0):.3f}")
-        if 'precision@1' in avg_metrics:
-            print(f"  Precision@1:                {avg_metrics['precision@1']:.3f}")
-        if 'precision@3' in avg_metrics:
-            print(f"  Precision@3:                {avg_metrics['precision@3']:.3f}")
-        if 'precision@5' in avg_metrics:
-            print(f"  Precision@5:                {avg_metrics['precision@5']:.3f}")
-        if 'precision@10' in avg_metrics:
-            print(f"  Precision@10:               {avg_metrics['precision@10']:.3f}")
-        print(f"")
-        print(f"RECALL METRICS:")
-        print(f"  Recall@N:                   {avg_metrics.get('recall@N', 0.0):.3f}")
-        if 'recall@1' in avg_metrics:
-            print(f"  Recall@1:                   {avg_metrics['recall@1']:.3f}")
-        if 'recall@3' in avg_metrics:
-            print(f"  Recall@3:                   {avg_metrics['recall@3']:.3f}")
-        if 'recall@5' in avg_metrics:
-            print(f"  Recall@5:                   {avg_metrics['recall@5']:.3f}")
-        if 'recall@10' in avg_metrics:
-            print(f"  Recall@10:                  {avg_metrics['recall@10']:.3f}")
-        print(f"")
-        print(f"F1 METRICS:")
-        print(f"  F1@N:                       {avg_metrics.get('f1@N', 0.0):.3f}")
-        if 'f1@1' in avg_metrics:
-            print(f"  F1@1:                       {avg_metrics['f1@1']:.3f}")
-        if 'f1@3' in avg_metrics:
-            print(f"  F1@3:                       {avg_metrics['f1@3']:.3f}")
-        if 'f1@5' in avg_metrics:
-            print(f"  F1@5:                       {avg_metrics['f1@5']:.3f}")
-        if 'f1@10' in avg_metrics:
-            print(f"  F1@10:                      {avg_metrics['f1@10']:.3f}")
-        print(f"")
-        print(f"RANKING METRICS:")
-        print(f"  Mean Average Precision:     {avg_metrics['average_precision']:.3f}")
-        print(f"")
-        print(f"RETRIEVAL STATISTICS:")
-        print(f"  Avg Passages Retrieved:     {avg_metrics.get('retrieved_passages_count', 0.0):.1f}")
-        print(f"  Avg Unique Docs (N):        {avg_metrics.get('retrieved_docs_count', 0.0):.1f}")
-        
-        # Add retrieval performance statistics if we have retrieval data
-        if retrieval_times and hasattr(rag_db, '_benchmark') and rag_db._benchmark:
-            import numpy as np
-            
-            print(f"")
-            print(f"🔍 RETRIEVAL PERFORMANCE STATISTICS:")
-            print(f"  Retrieval Time (ms):")
-            print(f"    Average:                  {np.mean(retrieval_times)*1000:.2f}ms")
-            print(f"    P50 (Median):             {np.percentile(retrieval_times, 50)*1000:.2f}ms")
-            print(f"    P99:                      {np.percentile(retrieval_times, 99)*1000:.2f}ms")
-            
-            if any(t > 0 for t in reranking_times):
-                print(f"  Reranking Time (ms):")
-                print(f"    Average:                  {np.mean(reranking_times)*1000:.2f}ms") 
-                print(f"    P50 (Median):             {np.percentile(reranking_times, 50)*1000:.2f}ms")
-                print(f"    P99:                      {np.percentile(reranking_times, 99)*1000:.2f}ms")
-            
-            print(f"  Total Query Time (ms):")
-            print(f"    Average:                  {np.mean(total_times)*1000:.2f}ms")
-            print(f"    P50 (Median):             {np.percentile(total_times, 50)*1000:.2f}ms")
-            print(f"    P99:                      {np.percentile(total_times, 99)*1000:.2f}ms")
-            
-            print(f"  Retrieval Throughput (docs/sec):")
-            print(f"    Average:                  {np.mean(docs_per_sec_list):.1f} docs/sec")
-            print(f"    P50 (Median):             {np.percentile(docs_per_sec_list, 50):.1f} docs/sec")
-            print(f"    P99:                      {np.percentile(docs_per_sec_list, 99):.1f} docs/sec")
-        
-        print(f"="*60)
-        
-        # Print detailed analysis if requested
-        if detailed_analysis:
-            _print_detailed_analysis(df, all_query_metrics, valid_queries)
-        
-        if collect_results:
-            return avg_metrics, collected_queries or []
-        return avg_metrics
-    else:
+    total_records = len(records)
+    if total_records == 0:
         print("No valid queries found!")
         if collect_results:
             return {}, []
         return {}
 
+    llm_batch_size = max(1, int(llm_batch_size or 1))
+    max_workers = min(llm_batch_size, total_records)
 
-def _print_detailed_analysis(df: pd.DataFrame, all_query_metrics: List[Dict[str, Any]], 
+    total_metrics: Dict[str, float] = {}
+    retrieval_times: List[float] = []
+    reranking_times: List[float] = []
+    total_times: List[float] = []
+    docs_per_sec_list: List[float] = []
+    collected_queries: Optional[List[Dict[str, Any]]] = [] if collect_results else None
+    analysis_entries: List[Dict[str, Any]] = []
+    valid_queries = 0
+
+    need_results = collect_results or (result_handler is not None)
+
+    def _summarize_docs_for_print(retrieved_docs: List[Any]) -> Dict[str, Any]:
+        doc_entries = []
+        seen_urls = set()
+        for doc in retrieved_docs:
+            url = None
+            content = ""
+            if hasattr(doc, 'metadata'):
+                url = doc.metadata.get('original_url') or doc.metadata.get('source')
+                content = doc.page_content
+            elif isinstance(doc, dict):
+                url = doc.get('url')
+                content = doc.get('content', "")
+            if url and url in seen_urls:
+                continue
+            doc_entries.append({
+                "url": url,
+                "content": (content or "")[:2000]
+            })
+            if url:
+                seen_urls.add(url)
+        return {"docs": doc_entries}
+
+    def _process_record(record_index: int, record: Dict[str, Any]) -> Dict[str, Any]:
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            metrics_output = evaluate_retrieval_query(
+                rag_db,
+                record['prompt'],
+                record['expected_urls'],
+                top_k_retriever,
+                top_k_reranking,
+                verbose=True,
+                no_rerank=no_rerank,
+                retrieval_strategy=retrieval_strategy,
+                return_results=need_results,
+                **strategy_params,
+            )
+        if need_results:
+            metrics, retrieved_docs = metrics_output
+        else:
+            metrics = metrics_output
+            retrieved_docs = []
+
+        collected_entry = None
+        if collect_results and retrieved_docs:
+            summary = _summarize_docs_for_print(retrieved_docs)
+            summary["prompt"] = record['prompt']
+            collected_entry = summary
+
+        handler_output = None
+        if result_handler:
+            handler_output = result_handler(record['prompt'], retrieved_docs, metrics)
+
+        return {
+            "metrics": metrics,
+            "log": buffer.getvalue(),
+            "collected": collected_entry,
+            "handler_output": handler_output,
+        }
+
+    results: List[Optional[Dict[str, Any]]] = [None] * total_records
+    next_to_emit = 0
+
+    def _flush_ready_outputs():
+        nonlocal next_to_emit, valid_queries
+        while next_to_emit < total_records and results[next_to_emit] is not None:
+            record = records[next_to_emit]
+            result = results[next_to_emit]
+            question_label = f"[Q{next_to_emit + 1}/{total_records}]"
+            prompt_preview = record['prompt'].replace('\n', ' ')
+            if len(prompt_preview) > 120:
+                prompt_preview = prompt_preview[:117] + '...'
+            print(f"\n{question_label} {prompt_preview}")
+
+            log_text = result['log'] or ""
+            if log_text:
+                print(log_text, end="" if log_text.endswith("\n") else "\n")
+
+            handler_text = result.get('handler_output')
+            if handler_text:
+                print(handler_text, end="" if handler_text.endswith("\n") else "\n")
+
+            metrics = result['metrics']
+            for metric_name, value in metrics.items():
+                if isinstance(value, (int, float)):
+                    total_metrics[metric_name] = total_metrics.get(metric_name, 0.0) + float(value)
+
+            if 'retrieval_time' in metrics:
+                retrieval_times.append(metrics['retrieval_time'])
+                reranking_times.append(metrics.get('reranking_time', 0.0))
+                total_times.append(metrics.get('total_retrieval_time', 0.0))
+                docs_per_sec_list.append(metrics.get('docs_per_second', 0.0))
+
+            if collect_results and result['collected'] is not None:
+                collected_queries.append(result['collected'])
+
+            if detailed_analysis:
+                analysis_entries.append({
+                    "metrics": metrics,
+                    "row_index": record['row_index'],
+                })
+
+            valid_queries += 1
+            next_to_emit += 1
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_index = {
+            executor.submit(_process_record, idx, record): idx for idx, record in enumerate(records)
+        }
+        for future in concurrent.futures.as_completed(future_to_index):
+            idx = future_to_index[future]
+            results[idx] = future.result()
+            _flush_ready_outputs()
+
+    if valid_queries > 0:
+        avg_metrics = {name: total / valid_queries for name, total in total_metrics.items()}
+        results_title = "OVERALL EVALUATION RESULTS" if detailed_analysis else "EVALUATION RESULTS"
+
+        print_evaluation_summary(
+            avg_metrics,
+            valid_queries,
+            title=results_title,
+        )
+
+        if retrieval_times and hasattr(rag_db, '_benchmark') and rag_db._benchmark:
+            import numpy as np
+
+            print("")
+            print(f"🔍 RETRIEVAL PERFORMANCE STATISTICS:")
+            print(f"  Retrieval Time (ms):")
+            print(f"    Average:                  {np.mean(retrieval_times) * 1000:.2f}ms")
+            print(f"    P50 (Median):             {np.percentile(retrieval_times, 50) * 1000:.2f}ms")
+            print(f"    P99:                      {np.percentile(retrieval_times, 99) * 1000:.2f}ms")
+
+            if any(t > 0 for t in reranking_times):
+                print(f"  Reranking Time (ms):")
+                print(f"    Average:                  {np.mean(reranking_times) * 1000:.2f}ms")
+                print(f"    P50 (Median):             {np.percentile(reranking_times, 50) * 1000:.2f}ms")
+                print(f"    P99:                      {np.percentile(reranking_times, 99) * 1000:.2f}ms")
+
+            print(f"  Total Query Time (ms):")
+            print(f"    Average:                  {np.mean(total_times) * 1000:.2f}ms")
+            print(f"    P50 (Median):             {np.percentile(total_times, 50) * 1000:.2f}ms")
+            print(f"    P99:                      {np.percentile(total_times, 99) * 1000:.2f}ms")
+
+            print(f"  Retrieval Throughput (docs/sec):")
+            print(f"    Average:                  {np.mean(docs_per_sec_list):.1f} docs/sec")
+            print(f"    P50 (Median):             {np.percentile(docs_per_sec_list, 50):.1f} docs/sec")
+            print(f"    P99:                      {np.percentile(docs_per_sec_list, 99):.1f} docs/sec")
+
+        if detailed_analysis:
+            _print_detailed_analysis(df, analysis_entries, valid_queries)
+
+        if collect_results:
+            return avg_metrics, collected_queries or []
+        return avg_metrics
+
+    print("No valid queries found!")
+    if collect_results:
+        return {}, []
+    return {}
+
+
+def _print_detailed_analysis(df: pd.DataFrame, analysis_entries: List[Dict[str, Any]],
                             valid_queries: int) -> None:
     """
     Print detailed dataset analysis broken down by reasoning types and answer link counts.
@@ -485,20 +514,23 @@ def _print_detailed_analysis(df: pd.DataFrame, all_query_metrics: List[Dict[str,
     
     # Prepare data - match metrics with reasoning types and link counts
     analysis_data = []
-    for idx, metrics in enumerate(all_query_metrics):
-        if idx < len(df):
-            row = df.iloc[idx]
-            reasoning_types = row.get('reasoning_types', 'Unknown')
-            
-            # Count Wikipedia links
-            num_links = sum(1 for col in df.columns 
-                          if col.startswith('wikipedia_link_') and pd.notna(row[col]))
-            
-            analysis_data.append({
-                'reasoning_types': reasoning_types,
-                'num_links': num_links,
-                'metrics': metrics
-            })
+    for entry in analysis_entries:
+        row_idx = entry.get('row_index')
+        if row_idx is None or row_idx >= len(df):
+            continue
+        row = df.iloc[row_idx]
+        metrics = entry.get('metrics', {})
+        reasoning_types = row.get('reasoning_types', 'Unknown')
+
+        num_links = sum(
+            1 for col in df.columns if col.startswith('wikipedia_link_') and pd.notna(row[col])
+        )
+
+        analysis_data.append({
+            'reasoning_types': reasoning_types,
+            'num_links': num_links,
+            'metrics': metrics
+        })
     
     # === ANALYSIS 1: By Reasoning Classification ===
     print("\n" + "-"*80)

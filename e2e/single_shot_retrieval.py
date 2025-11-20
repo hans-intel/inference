@@ -4,8 +4,11 @@ import time
 import os
 from retrieve import VectorDB, BM25DB
 from evaluation import evaluate_retrieval_query, run_evaluation
-from utils import set_deterministic_seeds, setup_llm_config, serialize_cli_args
-from params import add_all_args
+from utils import (
+    setup,
+    serialize_cli_args,
+    ensure_unique_path,
+)
 from llm_answer import (
     convert_results_to_entries,
     extract_unique_urls,
@@ -24,91 +27,18 @@ def _answer_doc_limit(args) -> int:
 if __name__ == "__main__":
     args = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter)
     
-    # Add all parameters from centralized definitions
-    # This includes: Common, General, BM25, Vector, Strategy, and Reranking parameters
-    add_all_args(args)
-    
-    # Special handling for --eval argument (needs custom type)
-    # Override the default eval argument with custom type
-    for action in args._actions:
-        if '--eval' in action.option_strings:
-            action.type = lambda x: int(x) if x.isdigit() else True
-            action.const = True
-            break
-
-    args = args.parse_args()
-
-    context_token_limit = args.llm_context_token_limit 
-    chars_per_token = args.llm_chars_per_token 
-    context_char_limit = int(context_token_limit * chars_per_token)
-
-    # Set deterministic seeds for reproducible results
-    set_deterministic_seeds(args.seed)
-    llm_config = setup_llm_config(args) if args.generate_answer else None
-    if llm_config:
-        context_char_limit = llm_config.get("context_char_limit", context_char_limit)
-        context_token_limit = llm_config.get("context_token_limit", context_token_limit)
-        chars_per_token = llm_config.get("chars_per_token", chars_per_token)
-    doc_base_dir = args.base_doc_dir
-
-    # Initialize the appropriate database class
-    if args.retrieval_method == "bm25":
-        db_class = BM25DB
-    else:
-        db_class = VectorDB
-
-    # Set default database path based on database class if not provided
-    if args.database is None:
-        args.database = db_class.get_default_db_name()
-    
-    # Normalize database path: ensure .db extension for file operations
-    db_file_path = args.database if args.database.endswith('.db') else f"{args.database}.db"
-    db_base_name = args.database.replace('.db', '') if args.database.endswith('.db') else args.database
-
-    # Create database instance (pass base name without .db)
-    rag_db = db_class(retriever_model=args.retriever_model, reranker_model=args.reranker_model, device=args.device, 
-                        k1=args.bm25_k1, b=args.bm25_b, method=args.bm25_method, database=db_base_name,
-                        delta=args.bm25_delta, backend=args.bm25_backend, stopwords=args.bm25_stopwords, 
-                        show_progress=args.bm25_show_progress, stemmer=args.bm25_stemmer, 
-                        vector_index_method=args.vector_index_method, ivf_nprobe=args.ivf_nprobe,
-                        load_embeddings=args.load_embeddings, num_embedding_devices=args.num_embedding_devices,
-                        benchmark=args.benchmark)
-
-    if os.path.exists(db_file_path):
-        # Load existing database
-        print(f"Loading existing database from {db_file_path}")
-        rag_db.from_serialized(db_file_path)
-    else:
-        if not args.ingest:
-            raise ValueError("Either --database (existing) or --ingest (to create new) must be provided")
-        
-        # Ingest from file or folder
-        tic = time.time()
-        rag_db.ingest_from_path(args.ingest, num_threads=args.threads)
-        
-        # Get number of passages for timing calculation
-        num_passages = len(rag_db._doc_list)  # This should be available after ingestion
-        toc = time.time()
-        ingestion_speed = num_passages/(toc-tic)
-        print(f"Ingestion of {num_passages} passages took {toc - tic:.2f} seconds. {ingestion_speed:.2f} docs/sec")
-        
-        # Save the database (unless --no-save is specified)
-        if not args.no_save:
-            print(f"Saving database to {db_file_path}")
-            rag_db.serialize(db_file_path)
-        else:
-            print("Skipping database save (--no-save specified)")
+    args, llm_config, device_config, rag_db, retrieval_config = setup(args)
 
     # Run evaluation or single query lookup
     if args.eval:
         max_queries = args.eval if isinstance(args.eval, int) and not isinstance(args.eval, bool) and args.eval > 0 else None
         
-        # Build strategy_params with correct parameter names for filter function
-        strategy_params = {"max_results": args.max_results}
+        # Build retrieval_config with correct parameter names for filter function
+        retrieval_config = {"max_results": args.max_results}
         if args.retrieval_strategy == "top_p":
-            strategy_params["p"] = args.top_p
+            retrieval_config["p"] = args.top_p
         elif args.retrieval_strategy == "relative":
-            strategy_params["ratio"] = args.relative_ratio
+            retrieval_config["ratio"] = args.relative_ratio
         
         answer_records = []
         answer_doc_limit = _answer_doc_limit(args)
@@ -144,10 +74,10 @@ if __name__ == "__main__":
             max_queries=max_queries,
             no_rerank=args.no_rerank,
             retrieval_strategy=args.retrieval_strategy,
-            detailed_analysis=True,
+            detailed_analysis=args.detailed_analysis,
             difficulty=args.difficulty,
             result_handler=handle_result if (args.generate_answer or args.save_results) else None,
-            **strategy_params
+            retrieval_config=retrieval_config,
         )
         
         # Save results for optimization
@@ -160,20 +90,22 @@ if __name__ == "__main__":
             json.dump(results_data, f, indent=2)
         
         if args.save_results:
-            with open("result_single_shot.json", "w") as f:
+            result_path = ensure_unique_path("result_single_shot.json")
+            with open(result_path, "w") as f:
                 json.dump({
                     "params": serialize_cli_args(args),
                     "results": answer_records
                 }, f, indent=2)
+            print(f"Compatible results saved to {result_path}")
         exit(0)  # Exit after evaluation
     else:
         # Single query lookup - reuse evaluation code for consistency
         
-        strategy_params = {}
+        retrieval_config = {}
         if args.retrieval_strategy == "top_p":
-            strategy_params["p"] = args.top_p
+            retrieval_config["p"] = args.top_p
         elif args.retrieval_strategy == "relative":
-            strategy_params["ratio"] = args.relative_ratio
+            retrieval_config["ratio"] = args.relative_ratio
         
         # Time the retrieval
         tic = time.time()
@@ -190,7 +122,7 @@ if __name__ == "__main__":
             print_results=True,
             return_results=need_results,
             max_results=args.max_results,
-            **strategy_params
+            retrieval_config=retrieval_config,
         )
         if need_results:
             _, retrieved_docs = eval_output

@@ -170,6 +170,16 @@ COMMON_PARAMS = [
         applies_to=["both"]
     ),
     ParamDef(
+        name="detailed_analysis",
+        arg_names=["--detailed-analysis"],
+        type=bool,
+        default=True,
+        help="Print detailed dataset analysis grouped by reasoning type and hop count",
+        action=argparse.BooleanOptionalAction,
+        category="common",
+        applies_to=["both"]
+    ),
+    ParamDef(
         name="retriever_model",
         arg_names=["--retriever_model"],
         type=str,
@@ -321,7 +331,7 @@ GENERAL_PARAMS = [
         name="llm_context_token_limit",
         arg_names=["--llm-context-token-limit"],
         type=int,
-        default=40960,
+        default=74880,
         help="Maximum total tokens for retrieval context sent to the LLM (set 0 to disable clipping)",
         category="general",
         applies_to=["both"]
@@ -332,6 +342,15 @@ GENERAL_PARAMS = [
         type=float,
         default=4.0,
         help="Average characters per token used when converting token budgets to character budgets",
+        category="general",
+        applies_to=["both"]
+    ),
+    ParamDef(
+        name="llm_timeout",
+        arg_names=["--llm-timeout"],
+        type=int,
+        default=600,
+        help="Timeout in seconds for LLM service calls",
         category="general",
         applies_to=["both"]
     ),
@@ -371,6 +390,15 @@ GENERAL_PARAMS = [
         default=False,
         help="Generate LLM answer outputs and save them alongside retrieval results",
         action="store_true",
+        category="general",
+        applies_to=["both"]
+    ),
+    ParamDef(
+        name="llm_batch_size",
+        arg_names=["--llm-batch-size"],
+        type=int,
+        default=1,  # Sequential processing for clean output; use higher values for parallel execution (may have interleaved output)
+        help="Maximum number of questions to process in parallel when sending requests to the LLM service",
         category="general",
         applies_to=["both"]
     ),

@@ -16,7 +16,6 @@ import argparse
 import json
 import time
 import os
-import re
 from typing import List, Dict, Any, Optional, Callable, Tuple, Set
 import pandas as pd
 
@@ -36,288 +35,38 @@ from utils import (
     is_token_limit_error,
 )
 from params import add_all_args
-from llm_answer import (
-    convert_results_to_entries,
-    generate_answer_from_entries,
-    uniform_clip_texts,
-)
 from prompt import QUERY_REWRITER_PROMPT
 import requests
 
 
-QUESTION_STOPWORDS = {
-    "the", "a", "an", "in", "on", "at", "of", "to", "for", "and", "or",
-    "if", "my", "your", "their", "our", "is", "are", "was", "were", "be",
-    "been", "have", "had", "has", "do", "does", "did", "with", "from", "by",
-    "who", "what", "when", "where", "why", "how", "which", "that", "this",
-    "these", "those", "same", "first", "second", "third", "fourth", "fifth",
-    "last", "latest", "year", "years", "as", "than", "into", "about",
-    "over", "under", "after", "before"
-}
-
-
-def _tokenize(text: str) -> List[str]:
-    if not text:
+def _uniform_clip_texts(texts: List[str], total_limit: int) -> List[str]:
+    if total_limit is None or total_limit <= 0 or not texts:
+        return list(texts)
+    count = len(texts)
+    if count == 0:
         return []
-    return [token.lower() for token in re.findall(r"[A-Za-z0-9']+", text)]
-
-
-def _split_into_sentences(text: str) -> List[str]:
-    if not text:
-        return []
-    normalized = re.sub(r"\s+", " ", text).strip()
-    if not normalized:
-        return []
-    sentences = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9])", normalized)
-    return [s.strip() for s in sentences if s.strip()]
-
-
-def _format_documents_for_prompt(
-    documents: List[Dict[str, Any]],
-    total_char_limit: Optional[int],
-) -> str:
-    if not documents:
-        return "(No documents yet)"
-
-    normalized_snippets: List[str] = []
-    sources: List[str] = []
-
-    for doc in documents:
-        metadata = doc.get("metadata") or {}
-        source = (
-            doc.get("url")
-            or metadata.get("original_url")
-            or metadata.get("source")
-            or metadata.get("base_filename")
-            or "Unknown source"
-        )
-        text = doc.get("content") or doc.get("raw_content") or ""
-        text = re.sub(r"\s+", " ", text).strip()
-        normalized_snippets.append(text)
-        sources.append(source)
-
-    clip_limit = total_char_limit if total_char_limit and total_char_limit > 0 else None
-    clipped_snippets = uniform_clip_texts(normalized_snippets, clip_limit)
-
-    formatted_parts: List[str] = []
-    for idx, snippet in enumerate(clipped_snippets, 1):
-        source = sources[idx - 1] if idx - 1 < len(sources) else "Unknown source"
-        body = snippet.strip() if snippet else "(No content)"
-        formatted_parts.append(f"[P{idx}] Source: {source}\n{body}")
-
-    return "\n\n".join(formatted_parts)
-
-
-def _build_evidence_clips(
-    question: str,
-    documents: List[Dict[str, Any]],
-    max_sentences: int = 12,
-    per_doc_limit: int = 2,
-    total_char_limit: int = 4096,
-) -> str:
-    if not documents:
-        return "(No evidence clips yet)"
-
-    question_tokens = [t for t in _tokenize(question) if t not in QUESTION_STOPWORDS]
-    if not question_tokens:
-        question_tokens = _tokenize(question)
-
-    scored_sentences: List[Tuple[float, str, str]] = []
-    for idx, doc in enumerate(documents, 1):
-        label = f"P{idx}"
-        sentences = _split_into_sentences(doc.get("content", "") or "")
-        if not sentences:
-            continue
-        doc_scores: List[Tuple[float, str]] = []
-        for sentence in sentences:
-            tokens = _tokenize(sentence)
-            if not tokens:
-                continue
-            overlap = sum(1 for token in tokens if token in question_tokens)
-            if overlap == 0:
-                continue
-            score = overlap / len(tokens)
-            doc_scores.append((score, sentence))
-        doc_scores.sort(reverse=True, key=lambda x: x[0])
-        for score, sentence in doc_scores[:per_doc_limit]:
-            scored_sentences.append((score, label, sentence))
-
-    if not scored_sentences:
-        return "(No evidence clips yet)"
-
-    scored_sentences.sort(reverse=True, key=lambda x: x[0])
-    selected = scored_sentences[:max_sentences]
-
-    lines: List[str] = []
-    total_chars = 0
-    for _, label, sentence in selected:
-        snippet = f"{label}: {sentence.strip()}"
-        projected = total_chars + len(snippet) + 1
-        if total_char_limit and projected > total_char_limit:
-            break
-        lines.append(snippet)
-        total_chars = projected
-
-    if not lines:
-        return "(No evidence clips yet)"
-    return "\n".join(lines)
-
-def _answer_doc_limit(top_k_retriever: Optional[int], top_k_reranking: Optional[int]) -> Optional[int]:
-    if isinstance(top_k_reranking, int) and top_k_reranking > 0:
-        return top_k_reranking
-    if isinstance(top_k_retriever, int) and top_k_retriever > 0:
-        return top_k_retriever
-    return None
-
-
-def _attempt_single_shot_answer(
-    question: str,
-    documents: List[Dict[str, Any]],
-    llm_config: Optional[Dict[str, Any]],
-    context_char_limit: int,
-    doc_limit: Optional[int] = None,
-) -> str:
-    if not documents or not llm_config:
-        return ""
-    doc_entries = convert_results_to_entries(
-        documents,
-        limit=doc_limit,
-        context_char_limit=context_char_limit,
-    )
-    base_limit = llm_config.get("context_char_limit", context_char_limit)
-    return generate_answer_from_entries(question, doc_entries, llm_config, base_limit)
-
-
-def _format_history_entries(history_entries: List[Dict[str, Any]]) -> str:
-    if not history_entries:
-        return "(No previous iterations yet)"
-
-    lines: List[str] = []
-    for entry in history_entries:
-        iteration = entry.get("iteration")
-        queries = entry.get("queries", [])
-        documents = entry.get("documents", [])
-        feedback = entry.get("feedback") or ""
-
-        lines.append(f"Iteration {iteration}:")
-        if queries:
-            for idx, query in enumerate(queries, 1):
-                lines.append(f"  Query {idx}: {query}")
+    per_doc, remainder = divmod(total_limit, count)
+    if per_doc <= 0 and remainder == 0:
+        return [""] * count
+    clipped: List[str] = []
+    for idx, text in enumerate(texts):
+        extra = 1 if idx < remainder else 0
+        limit = per_doc + extra
+        if limit <= 0:
+            clipped.append("")
         else:
-            lines.append("  Queries: (none)")
-
-        if documents:
-            lines.append("  Passages: " + "; ".join(documents))
-        else:
-            lines.append("  Passages: (none)")
-
-        if feedback:
-            lines.append(f"  Feedback: {feedback}")
-
-        lines.append("")
-
-    return "\n".join(lines).strip()
+            clipped.append(text[:limit])
+    return clipped
 
 
-def _retrieve_documents_for_queries(
-    sub_queries: List[str],
-    rag_db,
-    top_k_retriever: int,
-    no_rerank: bool,
-    retrieval_strategy: str,
-    strategy_params: Optional[Dict[str, Any]],
-    seen_passages: Set[Tuple[str, Any]],
-    verbose: bool = False,
-) -> Tuple[List[Dict[str, Any]], List[str]]:
-    """Run retrieval for the provided queries and return unique passages plus descriptions."""
-    if not sub_queries:
-        return [], []
-
-    docs_per_subquery = max(1, top_k_retriever)
-    target_docs_per_subquery = top_k_retriever
-    iteration_doc_descriptions: List[str] = []
-    retrieved_docs: List[Dict[str, Any]] = []
-
-    for i, sub_query in enumerate(sub_queries, 1):
-        if verbose:
-            print(f"\n  Retrieving for query {i}: {sub_query[:60]}...")
-
-        if retrieval_strategy == "fixed_k":
-            results = rag_db.lookup(sub_query, k=docs_per_subquery)
-        else:
-            from retrieve.filter import filter as adaptive_filter
-
-            params_copy = dict(strategy_params or {})
-            original_max_results = params_copy.get("max_results", 20)
-            params_copy["max_results"] = max(1, original_max_results)
-            results = adaptive_filter(
-                rag_db,
-                sub_query,
-                method=retrieval_strategy,
-                **params_copy,
-            )
-
-        if not no_rerank and results:
-            if verbose:
-                print(
-                    f"    Reranking {len(results)} docs for this subquery to top {target_docs_per_subquery}..."
-                )
-
-            contents = [r.page_content for r in results]
-            scored_passages = rag_db.rerank(sub_query, contents)
-            reranked_results: List[Dict[str, Any]] = []
-            used_indices: Set[int] = set()
-            for passage, _ in scored_passages:
-                for idx, doc in enumerate(results):
-                    if idx in used_indices:
-                        continue
-                    if doc.page_content == passage:
-                        reranked_results.append(doc)
-                        used_indices.add(idx)
-                        break
-
-            if reranked_results:
-                results = reranked_results
-
-            if verbose:
-                print(f"    After reranking: keeping top {len(results)} docs")
-
-        if len(results) > target_docs_per_subquery:
-            results = results[:target_docs_per_subquery]
-
-        new_passage_count = 0
-        for result in results:
-            metadata = result.metadata or {}
-            url = metadata.get('original_url') or metadata.get('base_filename')
-            passage_index = metadata.get('index')
-            passage_key = (url, passage_index)
-
-            if passage_key in seen_passages:
-                continue
-            seen_passages.add(passage_key)
-
-            doc_record = {
-                "url": url,
-                "content": result.page_content,
-                "metadata": metadata,
-            }
-            retrieved_docs.append(doc_record)
-
-            descriptor = f"{url or 'Unknown'} (idx {passage_index})"
-            iteration_doc_descriptions.append(descriptor)
-            new_passage_count += 1
-
-        if verbose:
-            print(f"    Retrieved {len(results)} docs, {new_passage_count} new unique passages")
-
-    return retrieved_docs, iteration_doc_descriptions
-
-
-def query_rewriter(question: str,
-                   documents: List[Dict[str, Any]],
-                   history_entries: Optional[List[Dict[str, Any]]] = None,
+def query_rewriter(question: str, new_documents: List[tuple],
+                   kept_documents: List[tuple],
                    max_queries: int = 3,
                    reasoning_effort: str = "medium",
+                   query_history: Optional[List[str]] = None,
+                   query_results: Optional[List[int]] = None,
+                   previous_feedback: str = "",
+                   feedback_history: Optional[List[str]] = None,
                    llm_config: Optional[Dict[str, Any]] = None,
                    context_char_limit: int = 0) -> Dict[str, Any]:
     """
@@ -329,8 +78,9 @@ def query_rewriter(question: str,
         kept_documents: List of KEPT document texts (already marked relevant)
         max_queries: Maximum number of new queries to generate
         reasoning_effort: LLM reasoning level
-    documents: Passages retrieved in the most recent iteration
-    history_entries: Chronological list of previous iterations containing queries, docs, and feedback
+        query_history: List of previous search queries
+        query_results: List of number of documents found for each query (parallel to query_history)
+        previous_feedback: Feedback from previous iteration about what's missing
         context_char_limit: Maximum characters to include per document snippet in the prompt
 
     Returns:
@@ -340,8 +90,9 @@ def query_rewriter(question: str,
         - 'answer': final answer if sufficient, otherwise empty string
         - 'reasoning': optional short justification string
     """
-    history_entries = history_entries or []
-    base_char_limit = context_char_limit if context_char_limit and context_char_limit > 0 else sum(len(doc.get("content", "")) for doc in documents)
+    combined_texts = [doc[1] or "" for doc in kept_documents] + [doc[1] or "" for doc in new_documents]
+
+    base_char_limit = context_char_limit if context_char_limit and context_char_limit > 0 else sum(len(text) for text in combined_texts)
     attempt_limit = base_char_limit
     min_limit = max(512, attempt_limit // 4) if attempt_limit else 512
     retry_factor = 0.6
@@ -352,27 +103,49 @@ def query_rewriter(question: str,
         model_name = llm_config["model_name"]
         service_url = llm_config["service_url"]
 
+    def build_sections(char_limit):
+        clipped_all = _uniform_clip_texts(combined_texts, char_limit)
+        kept_count = len(kept_documents)
+        kept_clipped = clipped_all[:kept_count]
+        new_clipped = clipped_all[kept_count:]
+
+        def format_block(label: str, docs: List[Tuple[str, str]], clipped: List[str]) -> str:
+            if not docs:
+                return f"{label}:\n  (none)"
+            parts = [f"{label}:"]
+            for idx, ((url, _), text) in enumerate(zip(docs, clipped), 1):
+                parts.append(f"[{label.split()[0]} {idx}] {url or 'Unknown source'}")
+                parts.append(text)
+            return "\n".join(parts)
+
+        return format_block("KEPT DOCUMENTS", kept_documents, kept_clipped), format_block("NEW DOCUMENTS", new_documents, new_clipped)
+
+    def format_history_block(items: List[str], label: str, max_items: int) -> str:
+        if not items:
+            return "(none)"
+        trimmed = items[-max_items:]
+        lines = [f"- {item}" for item in trimmed if item]
+        return "\n".join(lines) if lines else "(none)"
+
     last_error: Optional[Exception] = None
 
     for attempt in range(max_attempts):
-        context = _format_documents_for_prompt(documents, attempt_limit)
-        history_text = _format_history_entries(history_entries)
-        evidence_clips = _build_evidence_clips(
-            question,
-            documents,
-            total_char_limit=attempt_limit if attempt_limit else 4096,
-        )
+        kept_section, new_section = build_sections(attempt_limit)
+        context = f"{kept_section}\n\n{new_section}"
 
-        if documents:
-            print(f"    Evaluating {len(documents)} passage(s) from previous iteration")
-        else:
-            print("    No passages to evaluate yet; generating initial queries")
+        history_text = format_history_block(query_history or [], "History", 10)
+        feedback_text = format_history_block(feedback_history or [], "Feedback", 5)
+
+        print(f"Context: {context}")
+        print(f"History: {history_text}")
+        print(f"Feedback: {feedback_text}")
 
         prompt = QUERY_REWRITER_PROMPT.format(
             question=question,
             context=context,
-            history_chronological=history_text,
-            evidence_clips=evidence_clips,
+            history=history_text,
+            feedback_history=feedback_text,
+            k=max_queries,
         )
 
         payload = {
@@ -381,12 +154,10 @@ def query_rewriter(question: str,
                 {
                     "role": "system",
                     "content": (
-                        "You are a research expert helping solve multi-hop questions. "
-                        "Your strengths: (1) finding precise information quickly, "
-                        "(2) learning from search results to refine your approach, "
-                        "(3) using exact entity names and relationships, "
-                        "(4) knowing when you have enough information to answer. "
-                        "Focus on what works: specific queries, clear targets, adaptive strategy."
+                        "You are an expert at multi-hop reasoning and strategic search. "
+                        "CRITICAL: Never repeat failed queries. "
+                        "Always try meaningfully different queries, names, representations. "
+                        "Focus on atomic facts and progressive strategies."
                     ),
                 },
                 {"role": "user", "content": prompt},
@@ -442,7 +213,7 @@ def query_rewriter(question: str,
                 continue
             return {
                 "answer": "",
-                "queries": [question],
+                "queries": [question] if not query_history else [],
                 "feedback": f"API error: {http_err}",
                 "reasoning": "",
             }
@@ -450,7 +221,7 @@ def query_rewriter(question: str,
             last_error = req_err
             return {
                 "answer": "",
-                "queries": [question],
+                "queries": [question] if not query_history else [],
                 "feedback": f"API error: {req_err}",
                 "reasoning": "",
             }
@@ -460,7 +231,7 @@ def query_rewriter(question: str,
             print(f"LLM output: {llm_output[:200] if 'llm_output' in locals() else ''}")
             return {
                 "answer": "",
-                "queries": [question],
+                "queries": [question] if not query_history else [],
                 "feedback": f"JSON parse error: {json_err}",
                 "reasoning": "",
             }
@@ -470,7 +241,7 @@ def query_rewriter(question: str,
             traceback.print_exc()
             return {
                 "answer": "",
-                "queries": [question],
+                "queries": [question] if not query_history else [],
                 "feedback": f"Unexpected error: {exc}",
                 "reasoning": "",
             }
@@ -480,10 +251,167 @@ def query_rewriter(question: str,
 
     return {
         "answer": "",
-        "queries": [question],
+        "queries": [question] if not query_history else [],
         "feedback": "Failed to generate response",
         "reasoning": "",
     }
+
+
+def query_rewriter_llm(original_query: str, max_queries: int = 3, reasoning_effort: str = "medium",
+                       history: Optional[List[str]] = None, retrieved_docs: Optional[List[str]] = None,
+                       llm_config: Optional[Dict[str, Any]] = None) -> List[str]:
+    """
+    Use LLM to decompose a complex query into multiple sub-queries, or generate new queries
+    based on iterative feedback.
+    
+    Args:
+        original_query: The original complex query
+        max_queries: Maximum number of sub-queries to generate (default: 3)
+        reasoning_effort: LLM reasoning level (low/medium/high)
+        history: Optional list of previous search queries (for iterative mode)
+        retrieved_docs: Optional list of retrieved document texts (for iterative mode)
+        
+    Returns:
+        List of sub-queries
+    """
+    
+    # Determine if this is initial decomposition or iterative refinement
+    is_iterative = history is not None and retrieved_docs is not None
+    
+    if is_iterative:
+        # Iterative mode: Generate new queries based on what's been retrieved
+        history_text = "\n".join(f"- {q}" for q in history) if history else "None yet"
+        
+        results_text = ""
+        for i, doc in enumerate(retrieved_docs, 1):
+            results_text += f"\n[Document {i}]\n{doc[:300]}...\n"
+        
+        if not results_text:
+            results_text = "None yet"
+        
+        prompt = QUERY_REWRITER_ITERATIVE_PROMPT.format(
+            k=max_queries,
+            user_question=original_query,
+            history=history_text,
+            results=results_text
+        )
+        system_prompt = f"You are a helpful assistant that generates search queries."
+    else:
+        # Initial decomposition mode
+        system_prompt = f"""You are an expert at decomposing complex multi-hop questions into simpler sub-questions.
+
+Your task: Given a complex question, break it down into 1-{max_queries} simpler sub-questions that, when answered together, would help answer the original question.
+
+Guidelines:
+1. Identify the key facts/entities needed to answer the question
+2. Create sub-questions that retrieve each piece of information
+3. Order sub-questions logically (dependencies first)
+4. Keep sub-questions clear and specific
+5. If the question is already simple, return just the original question
+
+Output format: Return ONLY a JSON array of sub-questions, nothing else.
+Example: ["What year did X happen?", "Who won Y in that year?"]
+"""
+        prompt = f"""Original question: {original_query}
+
+Decompose this into at most {max_queries} sub-questions. Return only the JSON array."""
+
+    # Use LLM config if provided, otherwise use defaults
+    if llm_config:
+        model_name = llm_config["model_name"]
+        service_url = llm_config["service_url"]
+        max_tokens = llm_config.get("output_token_limit")
+
+    payload = {
+        "model": model_name,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.3,
+        "max_tokens": max_tokens,
+        "reasoning_effort": reasoning_effort
+    }
+    
+    try:
+        response = requests.post(service_url, json=payload, timeout=300)
+        
+        if response.status_code != 200:
+            print(f"Error response: {response.text[:500]}")
+            print(f"Falling back to original query")
+            return [original_query]
+        
+        result = response.json()
+        
+        # Use only content field
+        message = result['choices'][0]['message']
+        llm_output = message.get('content')
+        
+        # For debugging: check if reasoning_content exists
+        reasoning_content = message.get('reasoning_content', '')
+        if reasoning_content and not llm_output:
+            print(f"DEBUG: reasoning_content exists but content is empty")
+            print(f"DEBUG: reasoning_content snippet: {reasoning_content[:200]}")
+        
+        if llm_output is None or not llm_output.strip():
+            print(f"Warning: LLM returned empty content for query rewriting")
+            return [original_query]
+        
+        llm_output = llm_output.strip()
+        
+        if not is_iterative:
+            print(f"LLM output: {llm_output[:200]}...")
+        
+        # Parse JSON output - handle markdown code blocks
+        if llm_output.startswith("```json"):
+            llm_output = llm_output.replace("```json", "").replace("```", "").strip()
+        elif llm_output.startswith("```"):
+            llm_output = llm_output.split("```")[1]
+            if llm_output.startswith("json"):
+                llm_output = llm_output[4:]
+            llm_output = llm_output.strip()
+        
+        sub_queries = json.loads(llm_output)
+        
+        # Validate output
+        if not isinstance(sub_queries, list):
+            print(f"Warning: LLM output is not a list, using original query")
+            return [original_query]
+        
+        # Limit to max_queries
+        sub_queries = sub_queries[:max_queries]
+        
+        # Ensure at least the original query is included if list is empty
+        if not sub_queries:
+            return [original_query]
+        
+        if not is_iterative:
+            print(f"\n{'='*80}")
+            print(f"QUERY DECOMPOSITION")
+            print(f"{'='*80}")
+            print(f"Original: {original_query}")
+            print(f"Sub-queries ({len(sub_queries)}):")
+            for i, sq in enumerate(sub_queries, 1):
+                print(f"  {i}. {sq}")
+            print(f"{'='*80}\n")
+        
+        return sub_queries
+        
+    except requests.exceptions.RequestException as e:
+        print(f"Error calling LLM service: {e}")
+        print(f"Falling back to original query")
+        return [original_query]
+    except json.JSONDecodeError as e:
+        print(f"Error parsing LLM output as JSON: {e}")
+        print(f"LLM output: {llm_output[:200]}")
+        print(f"Falling back to original query")
+        return [original_query]
+    except Exception as e:
+        print(f"Unexpected error in query rewriting: {e}")
+        import traceback
+        traceback.print_exc()
+        print(f"Falling back to original query")
+        return [original_query]
 
 
 def multi_shot_retrieval(rag_db, original_query: str, expected_urls: List[str],
@@ -530,12 +458,15 @@ def multi_shot_retrieval(rag_db, original_query: str, expected_urls: List[str],
     
     start_time = time.perf_counter()
     
-    kept_docs: List[Dict[str, Any]] = []  # Passages already reviewed by the LLM
-    pending_docs: List[Dict[str, Any]] = []  # Passages to review in the next iteration
-    iteration_history: List[Dict[str, Any]] = []
+    # Track iteration history
+    query_history = []
+    query_results = []  # Track how many docs each query found
+    kept_docs: List[Tuple[str, str]] = []  # Accumulated (url, content) pairs
+    new_docs = []   # List of (url, content) tuples just retrieved this iteration
+    all_retrieved_urls = set()
     iteration_times = []
-    total_query_count = 0
-    seen_passages: Set[Tuple[str, Any]] = set()
+    previous_feedback = ""  # Feedback from previous iteration
+    feedback_history = []  # Track all feedback to show progression
     
     sufficient = False
     iteration = 0
@@ -550,100 +481,7 @@ def multi_shot_retrieval(rag_db, original_query: str, expected_urls: List[str],
         print(f"Max sub-queries per iteration: {max_sub_queries}")
         print(f"{'='*80}\n")
     
-    original_query_clean = (original_query or "").strip()
-    pending_single_shot = False
-    answer_doc_limit = _answer_doc_limit(top_k_retriever, top_k_reranking)
-    if original_query_clean:
-        baseline_docs, initial_doc_descriptions = _retrieve_documents_for_queries(
-            [original_query_clean],
-            rag_db,
-            top_k_retriever,
-            no_rerank,
-            retrieval_strategy,
-            strategy_params,
-            seen_passages,
-            verbose,
-        )
-        pending_docs.extend(baseline_docs)
-        total_query_count += 1
-
-        history_feedback = "Initial retrieval using original question"
-        iteration_history.append({
-            "iteration": 0,
-            "queries": [original_query_clean],
-            "documents": initial_doc_descriptions,
-            "feedback": history_feedback,
-        })
-
-        pending_single_shot = bool(pending_docs and llm_config)
-
-    while not sufficient and (iteration < max_iterations or pending_single_shot):
-        if pending_single_shot:
-            if verbose:
-                print(f"\n{'─'*80}")
-                print("BASELINE SINGLE-SHOT EVALUATION")
-                print(f"{'─'*80}")
-
-            try:
-                baseline_doc_limit = answer_doc_limit or len(pending_docs)
-                if baseline_doc_limit:
-                    baseline_doc_limit = min(baseline_doc_limit, len(pending_docs))
-                else:
-                    baseline_doc_limit = len(pending_docs)
-                if verbose:
-                    print(f"    Using top {baseline_doc_limit} document(s) for baseline answer")
-                    for idx, doc in enumerate(pending_docs[:baseline_doc_limit], 1):
-                        metadata = doc.get("metadata") or {}
-                        url = doc.get("url") or metadata.get("original_url") or metadata.get("source") or metadata.get("base_filename")
-                        passage_index = metadata.get("index")
-                        print(f"      [{idx}] URL: {url} | Passage #{passage_index}")
-                baseline_answer = _attempt_single_shot_answer(
-                    original_query,
-                    pending_docs,
-                    llm_config,
-                    context_char_limit,
-                    doc_limit=baseline_doc_limit,
-                )
-                if verbose:
-                    preview = baseline_answer.strip() if isinstance(baseline_answer, str) else str(baseline_answer)
-                    print(f"    Baseline answer preview: {preview[:200] if preview else '(empty)'}")
-            except Exception as exc:
-                baseline_answer = ""
-                if verbose:
-                    print(f"    Baseline answer attempt failed: {exc}")
-
-            note = "Single-shot answer: " + (baseline_answer.strip() or "(empty)")
-            if iteration_history:
-                existing_feedback = iteration_history[-1].get("feedback", "")
-                iteration_history[-1]["feedback"] = (
-                    f"{existing_feedback} | {note}" if existing_feedback else note
-                )
-
-            pending_single_shot = False
-
-            baseline_clean = ""
-            if isinstance(baseline_answer, str):
-                baseline_clean = baseline_answer.strip()
-            elif baseline_answer is not None:
-                baseline_clean = str(baseline_answer).strip()
-            normalized_baseline = baseline_clean.lower()
-
-            if baseline_clean and normalized_baseline != "unknown":
-                final_answer = baseline_clean
-                sufficient = True
-                kept_docs.extend(pending_docs)
-                pending_docs = []
-                if verbose:
-                    print("    Single-shot answer deemed sufficient. Skipping iterative refinement.")
-                break
-
-            if verbose:
-                print("    Single-shot attempt insufficient; starting iterative refinement.")
-            continue
-
-        if iteration >= max_iterations:
-            break
-
+    while not sufficient and iteration < max_iterations:
         iteration += 1
         iteration_start = time.perf_counter()
         
@@ -652,16 +490,20 @@ def multi_shot_retrieval(rag_db, original_query: str, expected_urls: List[str],
             print(f"ITERATION {iteration}/{max_iterations}")
             print(f"{'─'*80}")
         
-        # Step 1: Evaluate most recent passages and decide next searches
+        # Step 1: Use combined function to grade NEW docs AND generate new queries
         if verbose:
             print(f"\n  Evaluating documents and generating queries...")
-
+        
         result = query_rewriter(
-            original_query,
-            documents=pending_docs,
-            history_entries=iteration_history,
+            original_query, 
+            new_documents=new_docs,
+            kept_documents=kept_docs,
             max_queries=max_sub_queries,
             reasoning_effort=reasoning_effort,
+            query_history=query_history,
+            query_results=query_results,
+            previous_feedback=previous_feedback,
+            feedback_history=feedback_history,
             llm_config=llm_config,
             context_char_limit=context_char_limit
         )
@@ -673,25 +515,35 @@ def multi_shot_retrieval(rag_db, original_query: str, expected_urls: List[str],
         current_feedback = result.get("feedback", "")
         final_answer = answer_text
         reasoning_steps = result.get("reasoning", "")
-        total_query_count += len(sub_queries)
+        
+        # Add to feedback history if it's new and meaningful
+        if current_feedback and current_feedback.strip() and current_feedback != previous_feedback:
+            feedback_history.append(current_feedback.strip())
+        
+        previous_feedback = current_feedback
         
         if verbose:
             print(f"    Sufficient: {'yes' if sufficient else 'no'}")
-            print(f"    Reviewed passages so far: {len(kept_docs)}")
-            if pending_docs:
-                print(f"    Pending passages: {len(pending_docs)}")
+            print(f"    Kept docs: {len(kept_docs)}")
+            if new_docs:
+                print(f"    New docs available: {len(new_docs)}")
             if reasoning_steps:
                 print(f"    Reasoning: {reasoning_steps[:300]}...")
             if not sufficient:
-                print(f"    Feedback: {current_feedback}")
+                print(f"    Feedback: {previous_feedback}")
                 print(f"    Generated {len(sub_queries)} new queries")
         
-        # Move previously evaluated passages into the kept set
-        if pending_docs:
-            kept_docs.extend(pending_docs)
-            pending_docs = []
+        # Keep all newly retrieved documents for future context
+        if new_docs:
+            for url, content in new_docs:
+                kept_docs.append((url, content))
+
             if verbose:
-                print(f"    Stored passages reviewed so far: {len(kept_docs)}")
+                print(f"    Added {len(new_docs)} docs to kept set")
+                print(f"    Total kept docs now: {len(kept_docs)}")
+        
+        # Clear new_docs for next iteration
+        new_docs = []
         
         # If sufficient, we're done
         if sufficient:
@@ -709,38 +561,84 @@ def multi_shot_retrieval(rag_db, original_query: str, expected_urls: List[str],
             iteration_times.append(time.perf_counter() - iteration_start)
             break
         
-        if verbose and sub_queries:
+        if verbose:
             print(f"\n  New queries:")
             for i, q in enumerate(sub_queries, 1):
                 print(f"    {i}. {q}")
         
         # Step 2: Retrieve for each sub-query and track results
-        retrieved_next_iter, iteration_doc_descriptions = _retrieve_documents_for_queries(
-            sub_queries,
-            rag_db,
-            top_k_retriever,
-            no_rerank,
-            retrieval_strategy,
-            strategy_params,
-            seen_passages,
-            verbose,
-        )
-        pending_docs = retrieved_next_iter
-
-        # Update iteration history for future LLM calls
-        iteration_history.append({
-            "iteration": iteration,
-            "queries": sub_queries,
-            "documents": iteration_doc_descriptions,
-            "feedback": (current_feedback or "").strip()
-        })
-
+        num_sub_queries = len(sub_queries)
+        #docs_per_subquery = max(1, top_k_retriever // num_sub_queries)
+        docs_per_subquery = max(1, top_k_retriever)
+        
+        iteration_results = []
+        per_query_counts = []  # Track new docs found by each query
+        
+        # Calculate target docs per subquery after reranking
+        #target_docs_per_subquery = max(5, top_k_retriever // num_sub_queries)
+        target_docs_per_subquery = top_k_retriever
+        
+        for i, sub_query in enumerate(sub_queries, 1):
+            if verbose:
+                print(f"\n  Retrieving for query {i}: {sub_query[:60]}...")
+            
+            query_start_count = len(new_docs)  # Track docs before this query
+            
+            # Retrieve
+            if retrieval_strategy == "fixed_k":
+                results = rag_db.lookup(sub_query, k=docs_per_subquery)
+            else:
+                from retrieve.filter import filter
+                original_max_results = strategy_params.get("max_results", 20)
+                #adjusted_max_results = max(1, original_max_results // num_sub_queries)
+                adjusted_max_results = max(1, original_max_results)
+                strategy_params_copy = strategy_params.copy()
+                strategy_params_copy["max_results"] = adjusted_max_results
+                results = filter(rag_db, sub_query, method=retrieval_strategy, **strategy_params_copy)
+            
+            # Apply per-subquery reranking if enabled
+            if not no_rerank and len(results) > target_docs_per_subquery:
+                if verbose:
+                    print(f"    Reranking {len(results)} docs for this subquery to top {target_docs_per_subquery}...")
+                
+                # Extract contents for reranking
+                contents = [r.page_content for r in results]
+                scored_passages = rag_db.rerank(sub_query, contents)
+                
+                # Reorder results by reranking scores and take top-k
+                reranked_indices = [i for i, _ in sorted(enumerate(scored_passages), 
+                                                         key=lambda x: x[1][1], reverse=True)]
+                results = [results[idx] for idx in reranked_indices[:target_docs_per_subquery]]
+                
+                if verbose:
+                    print(f"    After reranking: keeping top {len(results)} docs")
+            elif len(results) > target_docs_per_subquery:
+                # No reranking, just limit to target
+                results = results[:target_docs_per_subquery]
+            
+            # Add to new_docs for evaluation (avoid duplicates)
+            for result in results:
+                if 'original_url' in result.metadata and result.metadata['original_url']:
+                    url = result.metadata['original_url']
+                    if url not in all_retrieved_urls:
+                        all_retrieved_urls.add(url)
+                        new_docs.append((url, result.page_content))
+                        iteration_results.append(result)
+            
+            # Track how many NEW docs this query found
+            docs_found_by_query = len(new_docs) - query_start_count
+            per_query_counts.append(docs_found_by_query)
+            
+            if verbose:
+                print(f"    Retrieved {len(results)} docs, {docs_found_by_query} new unique docs from this query")
+        
+        # Add queries and their results to history
+        for sub_query, count in zip(sub_queries, per_query_counts):
+            query_history.append(sub_query)
+            query_results.append(count)
+        
         if verbose:
-            if iteration_doc_descriptions:
-                print("  New passages:")
-                for desc in iteration_doc_descriptions:
-                    print(f"      - {desc}")
-            print(f"  Total reviewed passages: {len(kept_docs)} | Pending: {len(pending_docs)}")
+            print(f"  Total kept docs: {len(kept_docs)}, new docs to evaluate: {len(new_docs)}")
         
         iteration_time = time.perf_counter() - iteration_start
         iteration_times.append(iteration_time)
@@ -751,17 +649,12 @@ def multi_shot_retrieval(rag_db, original_query: str, expected_urls: List[str],
             break
     
     # Final processing
-    if pending_docs:
-        kept_docs.extend(pending_docs)
-        pending_docs = []
-
     total_time = time.perf_counter() - start_time
     
     # Extract URLs from kept_docs
     retrieved_urls: List[str] = []
     seen_urls: Set[str] = set()
-    for doc in kept_docs:
-        url = doc.get("url")
+    for url, _ in kept_docs:
         if url and url not in seen_urls:
             seen_urls.add(url)
             retrieved_urls.append(url)
@@ -778,7 +671,7 @@ def multi_shot_retrieval(rag_db, original_query: str, expected_urls: List[str],
     metrics.update({
         'total_time': total_time,
         'num_iterations': iteration,
-        'total_queries': total_query_count,
+        'total_queries': len(query_history),
         'final_docs_count': len(retrieved_urls),
         'sufficient': sufficient,
         'avg_iteration_time': sum(iteration_times) / len(iteration_times) if iteration_times else 0
@@ -794,25 +687,25 @@ def multi_shot_retrieval(rag_db, original_query: str, expected_urls: List[str],
         print(f"{'='*80}")
         print(f"Original Query: {original_query[:100]}...")
         print(f"Iterations: {iteration}")
-    print(f"Total queries issued: {total_query_count}")
-    print(f"Sufficient: {'Yes' if sufficient else 'No'}")
-    if final_answer:
-        print(f"LLM Answer: {final_answer}")
-    if expected_answer:
-        print(f"Expected Answer: {expected_answer}")
-    print(f"Expected ({len(expected_set)}): {sorted(list(expected_set)[:5])}{'...' if len(expected_set) > 5 else ''}")
-    print(f"Retrieved ({len(retrieved_urls)} unique docs): {retrieved_urls[:5]}{'...' if len(retrieved_urls) > 5 else ''}")
-    matches = len(expected_set.intersection(set(retrieved_urls)))
-    print(f"Matches: {matches}")
-    print(f"\nMetrics:")
-    print(f"  P@N: {metrics.get('precision@N', 0.0):.3f}")
-    print(f"  R@N: {metrics.get('recall@N', 0.0):.3f}")
-    print(f"  F1@N: {metrics.get('f1@N', 0.0):.3f}")
-    print(f"  MAP: {metrics.get('average_precision', 0.0):.3f}")
-    print(f"\nTiming:")
-    print(f"  Avg per iteration: {metrics['avg_iteration_time']*1000:.1f}ms")
-    print(f"  Total: {total_time*1000:.1f}ms")
-    print(f"{'='*80}\n")
+        print(f"Total queries issued: {len(query_history)}")
+        print(f"Sufficient: {'Yes' if sufficient else 'No'}")
+        if final_answer:
+            print(f"LLM Answer: {final_answer}")
+        if expected_answer:
+            print(f"Expected Answer: {expected_answer}")
+        print(f"Expected ({len(expected_set)}): {sorted(list(expected_set)[:5])}{'...' if len(expected_set) > 5 else ''}")
+        print(f"Retrieved ({len(retrieved_urls)} unique docs): {retrieved_urls[:5]}{'...' if len(retrieved_urls) > 5 else ''}")
+        matches = len(expected_set.intersection(set(retrieved_urls)))
+        print(f"Matches: {matches}")
+        print(f"\nMetrics:")
+        print(f"  P@N: {metrics.get('precision@N', 0.0):.3f}")
+        print(f"  R@N: {metrics.get('recall@N', 0.0):.3f}")
+        print(f"  F1@N: {metrics.get('f1@N', 0.0):.3f}")
+        print(f"  MAP: {metrics.get('average_precision', 0.0):.3f}")
+        print(f"\nTiming:")
+        print(f"  Avg per iteration: {metrics['avg_iteration_time']*1000:.1f}ms")
+        print(f"  Total: {total_time*1000:.1f}ms")
+        print(f"{'='*80}\n")
     
     return metrics
 
