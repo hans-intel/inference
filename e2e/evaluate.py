@@ -1,5 +1,19 @@
+"""
+Evaluate single-shot or oracle results using an LLM judge.
+
+Supports loading results from:
+- JSON files (legacy format): result_single_shot.json
+- Pickle files (oracle format): oracle_checkpoint.pkl (pandas DataFrame)
+
+Usage:
+    python evaluate.py result_single_shot.json
+    python evaluate.py oracle_checkpoint.pkl
+    python evaluate.py oracle_checkpoint.pkl --dataset data/frames_dataset.tsv
+"""
+
 import argparse
 import json
+import pickle
 import re
 from pathlib import Path
 from typing import Optional
@@ -8,13 +22,25 @@ import pandas as pd
 import requests
 
 DEFAULT_JUDGE_URL = "http://127.0.0.1:8124/v1/chat/completions"
-DEFAULT_JUDGE_MODEL = "/mnt/weka/data/pytorch/llama3.1/Meta-Llama-3.1-8B-Instruct/"
+DEFAULT_JUDGE_MODEL = "/mnt/weka/data/pytorch/llama3.1/Meta-Llama-3.1-8B-Instruct"
 
 
 def load_results(path: Path):
-    data = json.loads(path.read_text(encoding="utf-8"))
-    results = data.get("results", [])
-    return {entry.get("prompt"): entry.get("llm_answer", "") for entry in results if entry.get("prompt")}
+    """Load results from either JSON or pickle checkpoint."""
+    if path.suffix == '.pkl':
+        # Load pandas DataFrame checkpoint
+        with open(path, 'rb') as f:
+            df = pickle.load(f)
+        
+        # Convert DataFrame to dict: query -> llm_answer
+        # Only include successfully completed queries
+        successful = df[df['success'] == True]
+        return {row['query']: row['llm_answer'] for _, row in successful.iterrows()}
+    else:
+        # Legacy JSON format
+        data = json.loads(path.read_text(encoding="utf-8"))
+        results = data.get("results", [])
+        return {entry.get("prompt"): entry.get("llm_answer", "") for entry in results if entry.get("prompt")}
 
 
 def _parse_score_value(value) -> int:
@@ -140,6 +166,24 @@ def call_judge(session: requests.Session, service_url: str, model: str, question
 
 def evaluate(results_path: Path, dataset_path: Path, service_url: str, model: str):
     predictions = load_results(results_path)
+    
+    # Show checkpoint stats if loading from pickle
+    if results_path.suffix == '.pkl':
+        with open(results_path, 'rb') as f:
+            checkpoint_df = pickle.load(f)
+        print(f"CHECKPOINT STATISTICS")
+        print("=" * 80)
+        print(f"Total queries in checkpoint: {len(checkpoint_df)}")
+        print(f"Successful queries: {(checkpoint_df['success'] == True).sum()}")
+        print(f"Failed queries: {(checkpoint_df['success'] == False).sum()}")
+        if 'num_docs' in checkpoint_df.columns:
+            total_docs = checkpoint_df['num_docs'].sum()
+            total_missing = checkpoint_df['num_missing_docs'].sum()
+            print(f"Total documents referenced: {total_docs}")
+            print(f"Missing documents: {total_missing} ({100*total_missing/total_docs:.2f}%)")
+        print("=" * 80)
+        print()
+    
     df = pd.read_csv(dataset_path, sep="\t")
     session = requests.Session()
     total = 0
@@ -181,7 +225,7 @@ def evaluate(results_path: Path, dataset_path: Path, service_url: str, model: st
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate single-shot results using an LLM judge.")
-    parser.add_argument("results", type=Path, help="Path to result_single_shot.json")
+    parser.add_argument("results", type=Path, help="Path to results (result_single_shot.json or oracle_checkpoint.pkl)")
     parser.add_argument("--dataset", type=Path, default=Path("data/frames_dataset.tsv"), help="Evaluation dataset TSV")
     parser.add_argument("--judge-url", default=DEFAULT_JUDGE_URL, help="Judge service endpoint")
     parser.add_argument("--judge-model", default=DEFAULT_JUDGE_MODEL, help="Judge model identifier")
