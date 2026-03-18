@@ -185,6 +185,8 @@ if __name__ == "__main__":
                         show_progress=args.bm25_show_progress, stemmer=args.bm25_stemmer, 
                         vector_index_method=args.vector_index_method, ivf_nprobe=args.ivf_nprobe,
                         load_embeddings=args.load_embeddings, num_embedding_devices=args.num_embedding_devices,
+                        embedding_batch_size=args.embedding_batch_size,
+                        faiss_indexing_batch_size=args.faiss_indexing_batch_size,
                         benchmark=args.benchmark)
 
     if os.path.exists(db_file_path):
@@ -234,7 +236,11 @@ if __name__ == "__main__":
                     full_doc=args.full_doc_context,
                     base_dir=doc_base_dir
                 )
-                answer_text = _generate_llm_answer(prompt, doc_entries, llm_config)
+                # GPU (XPU): NO — remote HTTP call to LLM service, not local inference
+                answer_text = rag_db._time_op(
+                    "llm_generation",
+                    lambda: _generate_llm_answer(prompt, doc_entries, llm_config)
+                )
                 print(f"LLM Answer: {answer_text}")
             if args.save_results:
                 record = {
@@ -274,6 +280,9 @@ if __name__ == "__main__":
                     "params": _serialize_params(args),
                     "results": answer_records
                 }, f, indent=2)
+
+        if args.benchmark:
+            rag_db.print_retrieval_timings()
         exit(0)  # Exit after evaluation
     else:
         # Single query lookup - reuse evaluation code for consistency
@@ -314,7 +323,11 @@ if __name__ == "__main__":
                 full_doc=args.full_doc_context,
                 base_dir=doc_base_dir
             )
-            answer_value = _generate_llm_answer(args.query, doc_entries, llm_config)
+            # GPU (XPU): NO — remote HTTP call to LLM service
+            answer_value = rag_db._time_op(
+                "llm_generation",
+                lambda: _generate_llm_answer(args.query, doc_entries, llm_config)
+            )
             print(f"LLM Answer: {answer_value}")
 
         if args.save_results:
@@ -330,5 +343,7 @@ if __name__ == "__main__":
                     "results": [record]
                 }, f, indent=2)
         toc = time.time()
-        
+
         print(f"\nLookup took {toc - tic:.3f} seconds")
+        if args.benchmark:
+            rag_db.print_retrieval_timings()

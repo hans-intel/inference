@@ -47,7 +47,7 @@ def _parallel_embed_worker(device_id, chunk_indices, chunks, result_queue, model
             encode_kwargs=encode_kwargs
         )
         
-        print(f"✓ Device {device}: Loaded model, processing {len(chunks)} chunk(s)")
+        print(f"✓ Device {device}: Loaded {model_name} model, processing {len(chunks)} chunk(s)")
         
         # Process all chunks assigned to this device
         for chunk_idx, chunk in zip(chunk_indices, chunks):
@@ -76,7 +76,9 @@ class VectorDB(RagDB):
             vector_index_method: str = "hnsw",
             ivf_nprobe: int = 10,
             load_embeddings: bool = True,
-            num_embedding_devices: int = 1,
+            num_embedding_devices: int = 2,
+            embedding_batch_size: int = 256,
+            faiss_indexing_batch_size: int = 0,
             benchmark: bool = False,
             **kwargs
         ):
@@ -86,15 +88,36 @@ class VectorDB(RagDB):
         self._vector_index_method = vector_index_method
         self._ivf_nprobe = ivf_nprobe
         self._load_embeddings = load_embeddings
-        self._num_embedding_devices = num_embedding_devices
 
         if self._device == "hpu":
             import habana_frameworks.torch.core as htcore
             os.environ["PT_HPU_LAZY_MODE"] = "1"
 
+        # Auto-detect number of embedding devices.
+        # For XPU (Intel GPU): use all available tiles unless the user explicitly
+        # requested fewer via --num_embedding_devices.
+        if self._device == "xpu" and torch.xpu.is_available():
+            available_xpu = torch.xpu.device_count()
+            # num_embedding_devices==1 is the CLI default; treat it as "auto" for XPU
+            # so both GPUs are used without requiring an extra flag.
+            # If the user consciously passed a value >1, respect it as a cap.
+            self._num_embedding_devices = (
+                available_xpu if num_embedding_devices == 1
+                else min(num_embedding_devices, available_xpu)
+            )
+            if self._num_embedding_devices > 1:
+                print(f"XPU auto-detect: {available_xpu} device(s) found, "
+                      f"using {self._num_embedding_devices} for embedding generation")
+        else:
+            self._num_embedding_devices = num_embedding_devices
+
+        self._embedding_batch_size = embedding_batch_size
+        # 0 means auto-compute in ingest() based on dataset size
+        self._faiss_indexing_batch_size = faiss_indexing_batch_size
+
         # Initialize embedding model with device configuration
         model_kwargs = {'device': self._device}
-        encode_kwargs = {'normalize_embeddings': True}
+        encode_kwargs = {'normalize_embeddings': True, 'batch_size': self._embedding_batch_size}
         
         self._embedding_model = HuggingFaceEmbeddings(
             model_name=self._retriever_model_name,
@@ -110,14 +133,20 @@ class VectorDB(RagDB):
         if isinstance(test_embedding_raw, list) and len(test_embedding_raw) > 0:
             test_element = test_embedding_raw[0]
             embedding_dtype = type(test_element)
-            embedding_itemsize = test_element.__sizeof__()  # Size in bytes of one element
-            self._embedding_bytes_per_element = embedding_itemsize
+            # sentence-transformers returns Python floats, but the underlying
+            # tensor is float32 = 4 bytes. __sizeof__() gives 24 (CPython object
+            # overhead) which is wrong for memory/throughput calculations.
+            self._embedding_bytes_per_element = 4  # float32
         else:
             raise ValueError("Embedding query did not return a valid list of floats.")
 
         if self._benchmark:
-            print(f"   Embedding element type: {embedding_dtype}")
-            print(f"   Bytes per element: {embedding_itemsize}")
+            per_embedding_bytes = self._embedding_dimension * self._embedding_bytes_per_element
+            print(f"   Embedding element type: {embedding_dtype} (stored as float32 = 4 bytes)")
+            print(f"   Embedding dimension   : {self._embedding_dimension}")
+            print(f"   Per-embedding size    : {per_embedding_bytes:,} bytes "
+                  f"({per_embedding_bytes/1024:.1f} KB)")
+            print(f"   Embedding inference batch size: {self._embedding_batch_size}")
 
         # The index defines the algorithm used for the similarity search
         # Support multiple vector index types (currently FAISS-based)
@@ -316,7 +345,7 @@ class VectorDB(RagDB):
         else:
             # Fallback for unknown device types
             num_devices = 1
-        
+        print("num_devices requested:", num_devices)
         num_workers = min(self._num_embedding_devices, num_devices, len(passages))
         
         if num_workers <= 1:
@@ -341,8 +370,8 @@ class VectorDB(RagDB):
         # Create result queue and spawn one worker per device
         result_queue = mp.Queue()
         processes = []
-        
-        encode_kwargs = {'normalize_embeddings': True}
+
+        encode_kwargs = {'normalize_embeddings': True, 'batch_size': self._embedding_batch_size}
         
         # Spawn one worker per device (not per chunk)
         for device_id in range(num_workers):
@@ -423,6 +452,8 @@ class VectorDB(RagDB):
 
         # Generate embeddings if not cached
         if embeddings is None:
+            import time as _time
+            _embed_start = _time.perf_counter()
             if self._num_embedding_devices > 1:
                 # Use parallel embedding generation across multiple devices
                 embeddings = self._track_component("embedding_generation", total_chars, len(passages), 
@@ -433,15 +464,32 @@ class VectorDB(RagDB):
                 embeddings = self._track_component("embedding_generation", total_chars, len(passages), 
                                                   lambda: self._embedding_model.embed_documents(passages),
                                                   is_pipeline_input=True)
+            _embed_elapsed = _time.perf_counter() - _embed_start
+            _emb_per_sec = len(passages) / _embed_elapsed if _embed_elapsed > 0 else 0
+            _per_emb_bytes = self._embedding_dimension * self._embedding_bytes_per_element
+            _total_emb_mb = (len(passages) * _per_emb_bytes) / (1024 * 1024)
+            print(f"Embedding generation: {len(passages):,} embeddings in {_embed_elapsed:.2f}s")
+            print(f"  Throughput : {_emb_per_sec:,.0f} embeddings/sec")
+            print(f"  Dimension  : {self._embedding_dimension}  "
+                  f"({_per_emb_bytes} bytes/embedding = "
+                  f"{self._embedding_dimension} × float32)")
+            print(f"  Total data : {_total_emb_mb:.1f} MB  "
+                  f"({len(passages):,} × {_per_emb_bytes} bytes)")
+            print(f"  Device     : {self._device.upper()}  "
+                  f"(batch_size={self._embedding_batch_size}, "
+                  f"devices={self._num_embedding_devices})")
         
         # Train IVF index if needed (before adding any embeddings)
         if self._vector_index_method == "ivf" and not self._index.is_trained:
             self._train_vector_index(self._index, embeddings)
         
-        # Determine batch size: single batch for small datasets, multiple batches for scaling analysis
+        # Determine FAISS indexing batch size
         track_incremental = self._benchmark and self._monitor and len(passages) >= 500
         if track_incremental:
-            batch_size = max(1000, len(passages) // 10)  # 10 batches, minimum 1000 docs per batch
+            if self._faiss_indexing_batch_size > 0:
+                batch_size = min(self._faiss_indexing_batch_size, len(passages))
+            else:
+                batch_size = max(1000, len(passages) // 10)  # auto: 10 batches, min 1000
             print(f"🔬 Incremental indexing analysis: {len(passages)} docs in batches of {batch_size}")
         else:
             batch_size = len(passages)  # Single batch
@@ -544,70 +592,118 @@ class VectorDB(RagDB):
             )
     
     def lookup(self, query: str, k: int):
-        results = self._vector_store.similarity_search(query, k=k)
+        """Retrieve top-k results.
+
+        When --benchmark is active, query_embedding and vector_search are
+        timed separately:
+          query_embedding — GPU (XPU): YES, same model as ingestion embedding.
+          vector_search   — GPU (XPU): NO, FAISS has no Intel XPU backend.
+        """
+        # Step 1: embed the query (GPU-acceleratable)
+        query_vector = self._time_op(
+            "query_embedding",
+            lambda: self._embedding_model.embed_query(query)
+        )
+        # Step 2: FAISS nearest-neighbour search (CPU-only for XPU)
+        results = self._time_op(
+            "vector_search",
+            lambda: self._vector_store.similarity_search_by_vector(query_vector, k=k)
+        )
         return results
-    
+
     def lookup_with_scores(self, query: str, k: int):
         """
         Lookup documents with similarity scores.
         Returns list of (document, score) tuples.
-        
+
         Note: FAISS returns L2 distances (lower is better), but we convert to
         similarity scores (higher is better) for consistency with BM25.
+
+        query_embedding — GPU (XPU): YES.
+        vector_search   — GPU (XPU): NO (FAISS CPU-only for Intel XPU).
         """
-        results_with_scores = self._vector_store.similarity_search_with_score(query, k=k)
-        
-        # FAISS returns (document, distance) where distance is L2 distance (lower is better)
-        # Convert to similarity score (higher is better) by negating
-        # This makes it consistent with BM25 scores for filtering algorithms
+        query_vector = self._time_op(
+            "query_embedding",
+            lambda: self._embedding_model.embed_query(query)
+        )
+        results_with_scores = self._time_op(
+            "vector_search",
+            lambda: self._vector_store.similarity_search_with_score_by_vector(query_vector, k=k)
+        )
+        # FAISS returns L2 distance (lower is better); negate for consistent "higher is better"
         results_with_similarity = [(doc, -distance) for doc, distance in results_with_scores]
-        
         return results_with_similarity
 
     def rerank(self, query: str, passages: List[str]):
+        """Rerank with cross-encoder. GPU (XPU): YES — runs on self._device."""
         assert self._reranker_model is not None, "Reranker model not initialized"
         pairs = [[query, passage] for passage in passages]
 
-        with torch.no_grad():
-            inputs = self._reranker_tokenizer(pairs, padding=True, return_tensors='pt', truncation=True, max_length=512)
-            inputs = {k: v.to(self._device) for k, v in inputs.items()}
-            scores = self._reranker_model(**inputs).logits.view(-1).float()
-        
-        scored_passages = list(zip(passages, scores.cpu().tolist()))
-        # Sort by score descending
-        scored_passages.sort(key=lambda x: x[1], reverse=True)
-        
-        # Return passages in sorted order (optionally include scores)
-        return [(p, s) for p, s in scored_passages]
+        def _run():
+            with torch.no_grad():
+                inputs = self._reranker_tokenizer(
+                    pairs, padding=True, return_tensors='pt',
+                    truncation=True, max_length=512
+                )
+                inputs = {k: v.to(self._device) for k, v in inputs.items()}
+                scores = self._reranker_model(**inputs).logits.view(-1).float()
+            scored = list(zip(passages, scores.cpu().tolist()))
+            scored.sort(key=lambda x: x[1], reverse=True)
+            return [(p, s) for p, s in scored]
+
+        return self._time_op("reranking", _run)
 
 
     def serialize(self, path: str):
+        """Serialize FAISS index + docstore to disk.
+
+        GPU (XPU): NO — pure file I/O (serializes the CPU FAISS index).
+        """
         # Store path for output size calculation
         self._serialize_path = path
-        
-        data = self._vector_store.serialize_to_bytes()
-        with open(path, "wb") as f:
-            f.write(data)
-        
+
+        def _write():
+            data = self._vector_store.serialize_to_bytes()
+            with open(path, "wb") as f:
+                f.write(data)
+
+        self._time_op("db_serialize", _write)
+
+        # Report file size
+        file_size_mb = os.path.getsize(path) / (1024 ** 2)
+        print(f"VectorDB saved to {path} ({file_size_mb:.1f} MB)")
+
         # Update output size after serialization (now file exists)
         if self._benchmark and self._monitor:
             self._monitor.set_output_size_callback("faiss_indexing", self._calculate_index_output_size)
         
-        # Report performance after serialization if benchmarking
+        # Report ingestion performance summary
         if self._benchmark and self._monitor and hasattr(self, '_ingestion_start'):
-            # Determine db_type based on whether incremental was used
             db_type = "VectorDB (Incremental)" if hasattr(self._monitor, 'indexing_trend') and len(self._monitor.indexing_trend) > 0 else "VectorDB"
-            self._report_performance(self._ingestion_start, self._ingestion_item_count, 
+            self._report_performance(self._ingestion_start, self._ingestion_item_count,
                                     self._ingestion_total_chars, db_type)
 
     def from_serialized(self, path: str):
+        """Load FAISS index + docstore from disk.
+
+        GPU (XPU): NO — FAISS index stays on CPU. The embedding model (already
+        loaded in __init__) does run on XPU for subsequent query embedding calls.
+        """
         assert len(self._vector_store.index_to_docstore_id) == 0, "Vector store already has documents"
-        with open(path, "rb") as f:
-            data = f.read()
-        self._vector_store = FAISS.deserialize_from_bytes(embeddings=self._embedding_model,
-            serialized=data,
-            allow_dangerous_deserialization=True) # <--- USE WITH CAUTION - Only deserialize files you trust
-        
+        file_size_mb = os.path.getsize(path) / (1024 ** 2)
+
+        def _load():
+            with open(path, "rb") as f:
+                data = f.read()
+            return FAISS.deserialize_from_bytes(
+                embeddings=self._embedding_model,
+                serialized=data,
+                allow_dangerous_deserialization=True  # Only deserialize files you trust
+            )
+
+        self._vector_store = self._time_op("db_deserialize", _load)
+        print(f"VectorDB loaded from {path} ({file_size_mb:.1f} MB)")
+
         # If it's an IVF index, restore nprobe setting
         if self._vector_index_method == "ivf" and hasattr(self._vector_store.index, 'nprobe'):
             self._vector_store.index.nprobe = self._ivf_nprobe

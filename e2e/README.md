@@ -55,27 +55,37 @@ This will be used later for evaluation.
 You may use [download_docs.py](./download_docs.py) script. 
 ```bash
 $ python3 download_docs.py --help
-usage: download_docs.py [-h] [--tsv_path TSV_PATH] [--max_urls MAX_URLS] [--output_dir OUTPUT_DIR]
-                        [--output_data OUTPUT_DATA] [--processes PROCESSES] [--format {pdf,html}]
+usage: download_docs.py [-h] [--format {pdf,html}]
+                        [--tsv-path TSV_PATH | --urls URLS [URLS ...] | --url-file URL_FILE]
+                        [--output-dir OUTPUT_DIR] [--data-dir DATA_DIR] [--max-files MAX_FILES]
+                        [--processes PROCESSES] [--delay DELAY] [--timeout TIMEOUT]
+                        [--download-dataset]
 
-Download FRAMES dataset from Hugging Face and convert URLs to PDFs or HTML
+Download Wikipedia pages as PDFs or HTML files from FRAMES dataset or other sources.
+By default, URLs are validated before downloading to avoid 404 errors.
 
 options:
   -h, --help            show this help message and exit
-  --tsv_path TSV_PATH   Input TSV file (default: download FRAMES dataset)
-  --max_urls MAX_URLS   Maximum number of URLs to process (default: all)
-  --output_dir OUTPUT_DIR
-                        Output directory for downloaded documents (default: doc_pdf or doc_html)
-  --output_data OUTPUT_DATA
-                        Output directory for dataset file, if downloaded from Hugging Face (default:
-                        data)
-  --processes PROCESSES
-                        Number of parallel processes (default: 10)
   --format {pdf,html}   Output format: pdf or html (default: pdf)
+  --tsv-path TSV_PATH   Input TSV file from FRAMES dataset
+  --urls URLS [URLS ...]
+                        List of URLs to download
+  --url-file URL_FILE   File containing URLs (one per line)
+  --output-dir OUTPUT_DIR
+                        Output directory (default: doc_pdf for PDF, doc_html for HTML)
+  --data-dir DATA_DIR   Directory for dataset files (default: data)
+  --max-files MAX_FILES
+                        Maximum number of URLs to process (default: all)
+  --processes PROCESSES
+                        Number of parallel processes for PDF (HTML is sequential) (default: 10)
+  --delay DELAY         Delay between HTML downloads in seconds (default: 0.2)
+  --timeout TIMEOUT     Timeout for HTML requests in seconds (default: 30)
+  --download-dataset    Download FRAMES dataset if no TSV provided
 
 ## Sample usage
-$ python3 download_docs.py --output_dir doc_pdf --format pdf --processes 30 
-$ python3 download_docs.py --output_dir doc_html --format html --processes 30
+$ python3 download_docs.py --output-dir doc_pdf --format pdf --processes 30
+$ python3 download_docs.py --output-dir doc_html --format html --processes 30
+$ python3 download_docs.py --output-dir doc_html_100 --format html --processes 1 --max-files 100
 ## Will download documents in ./doc_pdf/ or ./doc_html/
 ```
 

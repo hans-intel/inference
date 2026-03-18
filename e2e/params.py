@@ -285,8 +285,28 @@ GENERAL_PARAMS = [
         name="num_embedding_devices",
         arg_names=["--num_embedding_devices"],
         type=int,
-        default=1,
+        default=2,
         help="Number of devices to use for parallel embedding generation (supports XPU, CUDA, CPU)",
+        category="general",
+        applies_to=["vector"]
+    ),
+    ParamDef(
+        name="embedding_batch_size",
+        arg_names=["--embedding_batch_size"],
+        type=int,
+        default=256,
+        help="Batch size for embedding inference (passages per GPU forward pass). "
+             "Larger values improve GPU utilization. Default: 256",
+        category="general",
+        applies_to=["vector"]
+    ),
+    ParamDef(
+        name="faiss_indexing_batch_size",
+        arg_names=["--faiss_indexing_batch_size"],
+        type=int,
+        default=0,
+        help="Batch size for inserting vectors into the FAISS index (0 = auto: max(1000, total//10)). "
+             "Only relevant when --benchmark is active for incremental scaling analysis.",
         category="general",
         applies_to=["vector"]
     ),

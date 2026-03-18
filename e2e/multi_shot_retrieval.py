@@ -1036,8 +1036,10 @@ if __name__ == "__main__":
         show_progress=args.bm25_show_progress, stemmer=args.bm25_stemmer,
         vector_index_method=args.vector_index_method, 
         ivf_nprobe=args.ivf_nprobe,
-        load_embeddings=args.load_embeddings, 
+        load_embeddings=args.load_embeddings,
         num_embedding_devices=args.num_embedding_devices,
+        embedding_batch_size=args.embedding_batch_size,
+        faiss_indexing_batch_size=args.faiss_indexing_batch_size,
         benchmark=args.benchmark
     )
     

@@ -12,6 +12,9 @@ class RagDB(abc.ABC):
         self._reranker_tokenizer = None
         self._benchmark = benchmark
         self._monitor = None
+        # Dict of {component_name: [latency_seconds, ...]} for query-time components.
+        # Single-shot values (serialize/deserialize) are stored as a one-element list.
+        self._retrieval_timings: Dict[str, list] = {}
         
         # Initialize monitoring if benchmark mode enabled
         if self._benchmark:
@@ -93,6 +96,71 @@ class RagDB(abc.ABC):
         else:
             return func()
     
+    def _time_op(self, name: str, func):
+        """Time a single operation and accumulate into _retrieval_timings when benchmark=True.
+        
+        Always executes func() and returns its result. When benchmark is enabled,
+        records wall-clock duration under the given name.
+        """
+        if not self._benchmark:
+            return func()
+        import time
+        t0 = time.perf_counter()
+        result = func()
+        duration = time.perf_counter() - t0
+        if name not in self._retrieval_timings:
+            self._retrieval_timings[name] = []
+        self._retrieval_timings[name].append(duration)
+        return result
+
+    def print_retrieval_timings(self):
+        """Print a summary of all retrieval-phase component timings."""
+        if not self._retrieval_timings:
+            return
+        import os as _os
+        device_label = self._device.upper()
+        # Annotate which components are XPU-accelerated
+        xpu_components = {"query_embedding", "reranking"}
+        xpu_available = False
+        try:
+            import torch
+            xpu_available = torch.xpu.is_available()
+        except Exception:
+            pass
+
+        print(f"\n⏱️  RETRIEVAL COMPONENT TIMINGS  [device={device_label}]")
+        print("=" * 62)
+        all_names = [
+            "db_deserialize",
+            "db_serialize",
+            "query_embedding",
+            "vector_search",
+            "reranking",
+            "llm_generation",
+        ]
+        # Print in pipeline order; include any unexpected names at the end
+        ordered = [n for n in all_names if n in self._retrieval_timings]
+        ordered += [n for n in self._retrieval_timings if n not in all_names]
+        for name in ordered:
+            times = self._retrieval_timings[name]
+            count = len(times)
+            total = sum(times)
+            avg = total / count
+            mn = min(times)
+            mx = max(times)
+            gpu_tag = ""
+            if name in xpu_components:
+                gpu_tag = " [XPU ✅]" if xpu_available else " [CPU only - XPU not available]"
+            else:
+                gpu_tag = " [CPU only]"
+            print(f"   {name}{gpu_tag}:")
+            if count == 1:
+                print(f"      {total*1000:.2f} ms")
+            else:
+                print(f"      calls={count:,}  avg={avg*1000:.2f}ms  "
+                      f"min={mn*1000:.2f}ms  max={mx*1000:.2f}ms  total={total:.3f}s")
+        print()
+
     def _start_ingestion_timer(self):
         """Start the ingestion timer. Works for both benchmark and non-benchmark modes."""
         import time
@@ -186,7 +254,11 @@ class RagDB(abc.ABC):
             raise ValueError(f"Source path {source_path} is neither a file nor a directory")
 
     def rerank(self, query: str, passages: List[str]):
-        """Rerank passages using the reranker model."""
+        """Rerank passages using the reranker model.
+
+        GPU (XPU): YES — cross-encoder inference runs on self._device.
+        FAISS search is CPU-only for Intel XPU; this is the GPU-acceleratable part.
+        """
         if self._reranker_model is None:
             # If no reranker, return passages with dummy scores
             return [(p, 0.0) for p in passages]
@@ -194,18 +266,18 @@ class RagDB(abc.ABC):
         import torch
         
         pairs = [[query, passage] for passage in passages]
-        
-        with torch.no_grad():
-            inputs = self._reranker_tokenizer(pairs, padding=True, return_tensors='pt', 
-                                            truncation=True, max_length=512)
-            inputs = {k: v.to(self._device) for k, v in inputs.items()}
-            scores = self._reranker_model(**inputs).logits.view(-1).float()
-        
-        scored_passages = list(zip(passages, scores.cpu().tolist()))
-        # Sort by score descending
-        scored_passages.sort(key=lambda x: x[1], reverse=True)
-        
-        return scored_passages
+
+        def _run():
+            with torch.no_grad():
+                inputs = self._reranker_tokenizer(pairs, padding=True, return_tensors='pt',
+                                                truncation=True, max_length=512)
+                inputs = {k: v.to(self._device) for k, v in inputs.items()}
+                scores = self._reranker_model(**inputs).logits.view(-1).float()
+            scored = list(zip(passages, scores.cpu().tolist()))
+            scored.sort(key=lambda x: x[1], reverse=True)
+            return scored
+
+        return self._time_op("reranking", _run)
     
     def lookup_with_rerank(self, query: str, k: int, rerank_k: int = None) -> List[Any]:
         """Retrieve and rerank passages."""

@@ -316,22 +316,22 @@ class BM25DB(RagDB):
         return results_with_scores
     
     def serialize(self, path: str):
-        """Save BM25 index and metadata."""
+        """Save BM25 index and metadata.
+
+        GPU (XPU): NO — pure file I/O and pickle serialization.
+        """
         if self._bm25_retriever is None:
             raise ValueError("BM25 retriever not initialized")
-        
+
         # Save BM25 index to separate directory based on database name
         bm25_dir = Path(self.get_data_dir(path))
-        self._bm25_retriever.save(str(bm25_dir))
-        
-        # Save database file
         db_path = Path(path)
-        
+
         data = {
             'type': 'BM25DB',
             'bm25_directory': str(bm25_dir),
             'passages_metadata': self._passages_metadata,
-            'doc_list': self._doc_list,  # Save the actual document content
+            'doc_list': self._doc_list,
             'num_passages': len(self._doc_list),
             'num_threads': getattr(self, '_num_threads', 4),
             'k1': self._k1,
@@ -343,35 +343,45 @@ class BM25DB(RagDB):
             'backend': self._backend,
             'token_pattern': self._token_pattern,
             'stopwords': self._stopwords,
-            'stemmer_type': self._get_stemmer_type(),  # Save stemmer type, not function
+            'stemmer_type': self._get_stemmer_type(),
             'lower': self._lower,
             'show_progress': self._show_progress
         }
-        
-        with open(db_path, 'wb') as f:
-            pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
-        
+
+        def _write():
+            self._bm25_retriever.save(str(bm25_dir))
+            with open(db_path, 'wb') as f:
+                pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+        self._time_op("db_serialize", _write)
+
         db_size = db_path.stat().st_size
         bm25_size = sum(f.stat().st_size for f in bm25_dir.rglob('*') if f.is_file())
         total_size = db_size + bm25_size
         print(f"BM25 database saved to {db_path} ({db_size / (1024**2):.1f} MB)")
         print(f"BM25 index saved to {bm25_dir} ({bm25_size / (1024**2):.1f} MB)")
         print(f"Total: {total_size / (1024**2):.1f} MB")
-        
-        # Update output size and report performance if benchmarking
+
+        # Update output size and report ingestion performance if benchmarking
         if self._benchmark and self._monitor:
             self._monitor.set_output_size_callback("bm25_indexing", self._calculate_index_output_size)
-            # Report performance after serialization so we have accurate output size
             if hasattr(self, '_ingestion_start'):
-                self._report_performance(self._ingestion_start, self._ingestion_item_count, 
+                self._report_performance(self._ingestion_start, self._ingestion_item_count,
                                         self._ingestion_total_chars, "BM25DB")
 
     def from_serialized(self, path: str):
-        """Load BM25 index and metadata."""
+        """Load BM25 index and metadata.
+
+        GPU (XPU): NO — pure file I/O and pickle deserialization.
+        """
         db_path = Path(path)
-        
-        with open(db_path, "rb") as f:
-            data = pickle.load(f)
+        file_size_mb = db_path.stat().st_size / (1024 ** 2)
+
+        def _load():
+            with open(db_path, "rb") as f:
+                return pickle.load(f)
+
+        data = self._time_op("db_deserialize", _load)
         
         # Check if BM25 parameters match current instance
         saved_k1 = data.get('k1', 1.5)
@@ -421,5 +431,5 @@ class BM25DB(RagDB):
             print("Warning: doc_list not found in database, using URLs as fallback")
             self._doc_list = [metadata.get('original_url', '') for metadata in self._passages_metadata]
         
-        print(f"BM25 database loaded from {db_path} ({len(self._doc_list)} passages)")
+        print(f"BM25 database loaded from {db_path} ({len(self._doc_list)} passages, {file_size_mb:.1f} MB)")
         print(f"BM25 parameters: k1={self._k1}, b={self._b}, method='{self._method}'")

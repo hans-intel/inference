@@ -596,8 +596,8 @@ def main():
     parser.add_argument("--text-boundary", choices=["sentence", "word", "none"], 
                        default="sentence",
                        help="Text boundary optimization: 'sentence' (default), 'word', or 'none'")
-    parser.add_argument("--processes", type=int, default=4,
-                       help="Number of parallel processes for document processing (default: 4)")
+    parser.add_argument("--processes", type=int, default=os.cpu_count(),
+                       help=f"Number of parallel processes for document processing (default: all CPUs = {os.cpu_count()})")
     parser.add_argument("--benchmark", action="store_true",
                        help="Enable performance monitoring and detailed component analysis")
 
