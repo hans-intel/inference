@@ -21,6 +21,7 @@ import os
 import pickle
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import pandas as pd
@@ -35,7 +36,7 @@ DEFAULT_MODEL_NAME = "/model/gpt-oss-120b-mxfp4"
 DEFAULT_BATCH_SIZE = 16
 DEFAULT_TIMEOUT = 2400
 # For reasoning model, it should be large enough
-#DEFAULT_MAX_TOKENS = 10*1024
+DEFAULT_MAX_TOKENS = 10*1024
 MAX_DOC_CHARS = 131072*4
 
 # Global cache for URL to filename mapping
@@ -298,67 +299,83 @@ def parse_wiki_links(wiki_links_str: str) -> List[str]:
         return []
 
 
+def process_single(
+    idx: int,
+    query: str,
+    ground_truth: str,
+    wiki_urls: List[str],
+    wiki_dir: Path,
+    llm_config: Dict
+) -> Dict:
+    """Process a single query and return the result dict."""
+    result = {
+        "index": idx,
+        "query": query,
+        "ground_truth": ground_truth,
+        "wiki_urls": str(wiki_urls),
+        "wiki_file_paths": "",
+        "doc_lengths": "",
+        "total_doc_length": 0,
+        "num_docs": len(wiki_urls),
+        "num_missing_docs": 0,
+        "llm_answer": "",
+        "success": False,
+        "failure_reason": ""
+    }
+
+    try:
+        documents, file_paths, doc_lengths = load_wiki_articles(wiki_urls, wiki_dir)
+        result["wiki_file_paths"] = str(file_paths)
+        result["doc_lengths"] = str(doc_lengths)
+        result["total_doc_length"] = sum(doc_lengths)
+
+        valid_docs = [d for d in documents if d.strip()]
+        missing_count = len(wiki_urls) - len(valid_docs)
+        result["num_missing_docs"] = missing_count
+
+        if missing_count > 0:
+            print(f"  Query {idx}: {missing_count}/{len(wiki_urls)} documents missing")
+
+        llm_answer = generate_llm_answer(query, documents, wiki_urls, llm_config)
+        result["llm_answer"] = llm_answer
+        result["success"] = True
+
+    except Exception as e:
+        result["failure_reason"] = str(e)
+        print(f"  Query {idx}: Failed - {e}")
+
+    return result
+
+
 def process_batch(
     batch_data: List[Tuple[int, str, str, List[str]]],
     wiki_dir: Path,
     llm_config: Dict
 ) -> List[Dict]:
     """
-    Process a batch of queries.
-    
+    Process a batch of queries in parallel.
+
     Args:
         batch_data: List of (index, query, answer, wiki_urls)
         wiki_dir: Path to wiki_articles directory
         llm_config: LLM configuration dict
-    
+
     Returns:
-        List of result dictionaries
+        List of result dictionaries sorted by original order
     """
-    results = []
-    
-    for idx, query, ground_truth, wiki_urls in batch_data:
-        result = {
-            "index": idx,
-            "query": query,
-            "ground_truth": ground_truth,
-            "wiki_urls": str(wiki_urls),  # Convert list to string for DataFrame
-            "wiki_file_paths": "",
-            "doc_lengths": "",
-            "total_doc_length": 0,
-            "num_docs": len(wiki_urls),
-            "num_missing_docs": 0,
-            "llm_answer": "",
-            "success": False,
-            "failure_reason": ""
-        }
-        
-        try:
-            # Load Wikipedia articles
-            documents, file_paths, doc_lengths = load_wiki_articles(wiki_urls, wiki_dir)
-            result["wiki_file_paths"] = str(file_paths)  # Convert list to string
-            result["doc_lengths"] = str(doc_lengths)  # Convert list to string
-            result["total_doc_length"] = sum(doc_lengths)
-            
-            # Check if we have at least some documents
-            valid_docs = [d for d in documents if d.strip()]
-            missing_count = len(wiki_urls) - len(valid_docs)
-            result["num_missing_docs"] = missing_count
-            
-            if missing_count > 0:
-                print(f"  Query {idx}: {missing_count}/{len(wiki_urls)} documents missing")
-            
-            # Generate LLM answer
-            llm_answer = generate_llm_answer(query, documents, wiki_urls, llm_config)
-            result["llm_answer"] = llm_answer
-            result["success"] = True
-            
-        except Exception as e:
-            result["failure_reason"] = str(e)
-            print(f"  Query {idx}: Failed - {e}")
-        
-        results.append(result)
-    
-    return results
+    futures_map = {}
+    with ThreadPoolExecutor(max_workers=len(batch_data)) as executor:
+        for idx, query, ground_truth, wiki_urls in batch_data:
+            future = executor.submit(process_single, idx, query, ground_truth, wiki_urls, wiki_dir, llm_config)
+            futures_map[future] = idx
+
+        results_map = {}
+        for future in as_completed(futures_map):
+            result = future.result()
+            results_map[result["index"]] = result
+
+    # Return in original batch order
+    return [results_map[idx] for idx, _, _, _ in batch_data]
 
 
 def main():
@@ -374,6 +391,10 @@ def main():
         raise FileNotFoundError(f"Dataset not found: {dataset_path}")
     if not wiki_dir.exists():
         raise FileNotFoundError(f"Wiki articles directory not found: {wiki_dir}")
+
+    # Pre-build URL cache once before threads start
+    global _url_to_file_cache
+    _url_to_file_cache = build_url_to_file_cache(wiki_dir)
     
     # Load dataset
     print(f"Loading dataset from {dataset_path}...")

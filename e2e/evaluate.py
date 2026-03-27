@@ -15,6 +15,7 @@ import argparse
 import json
 import pickle
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
@@ -164,9 +165,16 @@ def call_judge(session: requests.Session, service_url: str, model: str, question
     return score, explanation, content
 
 
-def evaluate(results_path: Path, dataset_path: Path, service_url: str, model: str):
+def _judge_row(idx, prompt, gold, pred, service_url, model):
+    """Call judge for a single row, returning (idx, prompt, gold, pred, score, explanation, raw)."""
+    session = requests.Session()
+    score, explanation, raw = call_judge(session, service_url, model, prompt, gold, pred)
+    return idx, prompt, gold, pred, score, explanation, raw
+
+
+def evaluate(results_path: Path, dataset_path: Path, service_url: str, model: str, batch_size: int = 16):
     predictions = load_results(results_path)
-    
+
     # Show checkpoint stats if loading from pickle
     if results_path.suffix == '.pkl':
         with open(results_path, 'rb') as f:
@@ -183,39 +191,46 @@ def evaluate(results_path: Path, dataset_path: Path, service_url: str, model: st
             print(f"Missing documents: {total_missing} ({100*total_missing/total_docs:.2f}%)")
         print("=" * 80)
         print()
-    
-    df = pd.read_csv(dataset_path, sep="\t")
-    session = requests.Session()
-    total = 0
-    judged = 0
-    unknown = 0
-    score_sum = 0
 
+    df = pd.read_csv(dataset_path, sep="\t")
+
+    # Build list of items to judge
+    items = []
     for idx, row in df.iterrows():
         prompt = row.get("Prompt")
         gold = str(row.get("Answer", "")).strip()
         if prompt not in predictions:
             continue
         pred = str(predictions[prompt]).strip()
-        total += 1
-        if pred.lower() == "unknown":
-            unknown += 1
-        score, explanation, raw = call_judge(session, service_url, model, prompt, gold, pred)
-        judged += 1
-        score_sum += score
-        print("=" * 80)
-        print(f"Prompt {idx}: {prompt}")
-        print(f"Gold: {gold}")
-        print(f"Answer: {pred}")
-        print(f"Judge Score: {score}")
-        print(f"Judge Explanation: {explanation if explanation else raw}")
+        items.append((idx, prompt, gold, pred))
 
-    if judged == 0:
+    if not items:
         print("No matching predictions found in results file.")
         return
 
-    accuracy = score_sum / judged if judged else 0.0
-    unknown_ratio = unknown / total if total else 0.0
+    total = len(items)
+    unknown = sum(1 for _, _, _, pred in items if pred.lower() == "unknown")
+
+    # Submit all judge calls in parallel (batch_size workers), print as they complete
+    score_sum = 0
+    with ThreadPoolExecutor(max_workers=batch_size) as executor:
+        futures = {
+            executor.submit(_judge_row, idx, prompt, gold, pred, service_url, model): idx
+            for idx, prompt, gold, pred in items
+        }
+        for future in as_completed(futures):
+            idx, prompt, gold, pred, score, explanation, raw = future.result()
+            score_sum += score
+            print("=" * 80)
+            print(f"Prompt {idx}: {prompt}")
+            print(f"Gold: {gold}")
+            print(f"Answer: {pred}")
+            print(f"Judge Score: {score}")
+            print(f"Judge Explanation: {explanation if explanation else raw}")
+
+    judged = len(items)
+    accuracy = score_sum / judged
+    unknown_ratio = unknown / total
     print("\nSUMMARY")
     print("-" * 80)
     print(f"Evaluated Samples: {judged}")
@@ -229,9 +244,10 @@ def parse_args():
     parser.add_argument("--dataset", type=Path, default=Path("data/frames_dataset.tsv"), help="Evaluation dataset TSV")
     parser.add_argument("--judge-url", default=DEFAULT_JUDGE_URL, help="Judge service endpoint")
     parser.add_argument("--judge-model", default=DEFAULT_JUDGE_MODEL, help="Judge model identifier")
+    parser.add_argument("--batch-size", type=int, default=16, help="Number of concurrent judge requests (default: 16)")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    evaluate(args.results, args.dataset, args.judge_url, args.judge_model)
+    evaluate(args.results, args.dataset, args.judge_url, args.judge_model, args.batch_size)
