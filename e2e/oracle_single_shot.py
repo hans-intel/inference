@@ -29,9 +29,13 @@ import requests
 
 DEFAULT_CHECKPOINT_FILE = "oracle_checkpoint.pkl"
 DEFAULT_SERVICE_URL = "http://localhost:8123/v1/chat/completions"
-DEFAULT_MODEL_NAME = "/mnt/weka/data/pytorch/llama3.3/Meta-Llama-3.3-70B-Instruct"
+#DEFAULT_MODEL_NAME = "/mnt/weka/data/pytorch/llama3.3/Meta-Llama-3.3-70B-Instruct"
+#DEFAULT_MODEL_NAME = "/mnt/weka/data/pytorch/llama3.1/Meta-Llama-3.1-405B-Instruct-v2"
+DEFAULT_MODEL_NAME = "/model/gpt-oss-120b-mxfp4"
 DEFAULT_BATCH_SIZE = 16
-DEFAULT_MAX_TOKENS = 256
+DEFAULT_TIMEOUT = 2400
+# For reasoning model, it should be large enough
+#DEFAULT_MAX_TOKENS = 10*1024
 MAX_DOC_CHARS = 131072*4
 
 # Global cache for URL to filename mapping
@@ -84,6 +88,25 @@ def parse_args():
         type=int,
         default=DEFAULT_MAX_TOKENS,
         help=f"Maximum tokens for LLM response (default: {DEFAULT_MAX_TOKENS})"
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=DEFAULT_TIMEOUT,
+        help=f"Timeout in seconds for LLM generation requests (default: {DEFAULT_TIMEOUT})"
+    )
+    parser.add_argument(
+        "--enable-thinking",
+        action="store_true",
+        default=False,
+        help="Enable thinking/reasoning in the model via chat_template_kwargs (default: False)"
+    )
+    parser.add_argument(
+        "--reasoning-effort",
+        type=str,
+        default=None,
+        choices=["low", "medium", "high"],
+        help="Reasoning effort level to pass to the model (default: not set)"
     )
     parser.add_argument(
         "--retry-failed",
@@ -230,12 +253,20 @@ def generate_llm_answer(query: str, documents: List[str], urls: List[str], llm_c
             {"role": "user", "content": user_prompt}
         ],
         "temperature": 0.0,
-        "max_tokens": llm_config["max_tokens"]
+        "max_tokens": llm_config["max_tokens"],
     }
-    
-    response = requests.post(llm_config["service_url"], json=payload, timeout=120)
+
+    if llm_config.get("enable_thinking"):
+        payload["chat_template_kwargs"] = {"enable_thinking": True}
+
+    if llm_config.get("reasoning_effort"):
+        payload["reasoning_effort"] = llm_config["reasoning_effort"]
+
+    response = requests.post(llm_config["service_url"], json=payload, timeout=llm_config["timeout"])
     response.raise_for_status()
     data = response.json()
+    #from pprint import pprint
+    #pprint(data, indent=4)
     return data["choices"][0]["message"]["content"].strip()
 
 
@@ -364,7 +395,10 @@ def main():
     llm_config = {
         "service_url": args.service_url,
         "model_name": args.model_name,
-        "max_tokens": args.max_tokens
+        "max_tokens": args.max_tokens,
+        "timeout": args.timeout,
+        "enable_thinking": args.enable_thinking,
+        "reasoning_effort": args.reasoning_effort,
     }
     
     # Determine which queries to process

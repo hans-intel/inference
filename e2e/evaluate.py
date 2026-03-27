@@ -191,7 +191,7 @@ def evaluate(results_path: Path, dataset_path: Path, service_url: str, model: st
     unknown = 0
     score_sum = 0
 
-    for _, row in df.iterrows():
+    for idx, row in df.iterrows():
         prompt = row.get("Prompt")
         gold = str(row.get("Answer", "")).strip()
         if prompt not in predictions:
@@ -204,7 +204,7 @@ def evaluate(results_path: Path, dataset_path: Path, service_url: str, model: st
         judged += 1
         score_sum += score
         print("=" * 80)
-        print(f"Prompt: {prompt}")
+        print(f"Prompt {idx}: {prompt}")
         print(f"Gold: {gold}")
         print(f"Answer: {pred}")
         print(f"Judge Score: {score}")
