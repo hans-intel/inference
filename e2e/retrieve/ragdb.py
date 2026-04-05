@@ -5,16 +5,24 @@ from typing import List, Dict, Any
 class RagDB(abc.ABC):
     """Base class for retrieval-augmented generation databases."""
     
-    def __init__(self, reranker_model: str = None, device: str = "auto", benchmark: bool = False):
+    def __init__(self, reranker_model: str = None, device: str = "auto", benchmark: bool = False, model_dtype: str = "bfloat16", reranker_batch_size: int = 256):
         self._reranker_model_name = reranker_model
         self._device = self._determine_device(device)
+        self._model_dtype = model_dtype
+        self._reranker_batch_size = reranker_batch_size
         self._reranker_model = None
         self._reranker_tokenizer = None
+        # Persistent NUMA-pinned reranking worker instances (set via set_reranking_instances)
+        self._reranking_instances = None
         self._benchmark = benchmark
         self._monitor = None
         # Dict of {component_name: [latency_seconds, ...]} for query-time components.
         # Single-shot values (serialize/deserialize) are stored as a one-element list.
         self._retrieval_timings: Dict[str, list] = {}
+        # LLM token stats: populated by single_shot_retrieval.py after LLM calls
+        self._llm_token_stats: Dict[str, float] = {}
+        # Per-component config (batch sizes, k values); populated by caller after construction
+        self._component_config: Dict[str, Any] = {}
         
         # Initialize monitoring if benchmark mode enabled
         if self._benchmark:
@@ -28,15 +36,15 @@ class RagDB(abc.ABC):
     def _determine_device(self, device: str) -> str:
         """Determine the best device to use."""
         import torch
-        
+
         if device == "auto":
-            if torch.hpu.is_available():
+            if getattr(torch, 'hpu', None) and torch.hpu.is_available():
                 print("Using HPU device")
                 return "hpu"
             elif torch.cuda.is_available():
                 print("Using CUDA device")
                 return "cuda"
-            elif torch.xpu.is_available():
+            elif getattr(torch, 'xpu', None) and torch.xpu.is_available():
                 print("Using XPU device")
                 return "xpu"
             else:
@@ -64,14 +72,20 @@ class RagDB(abc.ABC):
         import torch
         from transformers import AutoModelForSequenceClassification, AutoTokenizer
         
-        self._reranker_model = AutoModelForSequenceClassification.from_pretrained(self._reranker_model_name)
+        dtype = getattr(torch, self._model_dtype, torch.float32)
+        self._reranker_model = AutoModelForSequenceClassification.from_pretrained(
+            self._reranker_model_name, dtype=dtype)
         self._reranker_tokenizer = AutoTokenizer.from_pretrained(self._reranker_model_name)
-        device = self._device 
-        if device == "hpu":
-            print("Falling back to CPU for reranker as HPU is not supported.")
+        device = self._device
+        if device in ("hpu", "auto"):
+            print(f"Falling back to CPU for reranker (device='{device}' not supported).")
             device = "cpu"
         self._reranker_model = self._reranker_model.to(device)
         self._reranker_model.eval()
+        actual_dtype = next(self._reranker_model.parameters()).dtype
+        actual_device = next(self._reranker_model.parameters()).device
+        print(f"  Reranker  : {self._reranker_model_name}")
+        print(f"             dtype={actual_dtype}  device={actual_device}")
     
     def _track_component(self, name: str, total_chars: int, item_count: int, func, 
                         is_pipeline_input: bool = False, is_pipeline_output: bool = False):
@@ -113,6 +127,24 @@ class RagDB(abc.ABC):
         self._retrieval_timings[name].append(duration)
         return result
 
+    def _time_op_batch(self, name: str, func, n: int):
+        """Time a batch operation and record per-item latency (total/n) n times.
+
+        This preserves the avg/min/max semantics of _retrieval_timings so that
+        print_retrieval_timings reports meaningful per-query averages even when
+        the underlying calls are batched.
+        """
+        if not self._benchmark:
+            return func()
+        import time
+        t0 = time.perf_counter()
+        result = func()
+        total = time.perf_counter() - t0
+        per_item = total / max(n, 1)
+        timings = self._retrieval_timings.setdefault(name, [])
+        timings.extend([per_item] * n)
+        return result
+
     def print_retrieval_timings(self):
         """Print a summary of all retrieval-phase component timings."""
         if not self._retrieval_timings:
@@ -121,6 +153,7 @@ class RagDB(abc.ABC):
         device_label = self._device.upper()
         # Annotate which components are XPU-accelerated
         xpu_components = {"query_embedding", "reranking"}
+        remote_components = {"llm_generation"}
         xpu_available = False
         try:
             import torch
@@ -151,14 +184,47 @@ class RagDB(abc.ABC):
             gpu_tag = ""
             if name in xpu_components:
                 gpu_tag = " [XPU ✅]" if xpu_available else " [CPU only - XPU not available]"
+            elif name in remote_components:
+                gpu_tag = " [remote vLLM server]"
             else:
                 gpu_tag = " [CPU only]"
             print(f"   {name}{gpu_tag}:")
             if count == 1:
                 print(f"      {total*1000:.2f} ms")
+                if name == "llm_generation" and self._llm_token_stats:
+                    print(f"      ISL (input tokens) : {self._llm_token_stats.get('avg_isl', 0):.0f}")
+                    print(f"      OSL (output tokens): {self._llm_token_stats.get('avg_osl', 0):.0f}")
             else:
                 print(f"      calls={count:,}  avg={avg*1000:.2f}ms  "
                       f"min={mn*1000:.2f}ms  max={mx*1000:.2f}ms  total={total:.3f}s")
+                if name == "llm_generation" and self._llm_token_stats:
+                    print(f"      avg ISL (input tokens) : {self._llm_token_stats.get('avg_isl', 0):.1f}")
+                    print(f"      avg OSL (output tokens): {self._llm_token_stats.get('avg_osl', 0):.1f}")
+            # Print per-component config (batch sizes, k values) if available
+            cfg = self._component_config.get(name, {})
+            if cfg:
+                cfg_parts = []
+                if "model_batch_size" in cfg:
+                    cfg_parts.append(f"embed_batch={cfg['model_batch_size']}")
+                if "k" in cfg:
+                    cfg_parts.append(f"k={cfg['k']}")
+                if "k_in" in cfg and "k_out" in cfg:
+                    cfg_parts.append(f"k_in={cfg['k_in']}  k_out={cfg['k_out']}")
+                if "batch" in cfg:
+                    _rdp = cfg.get('dp', 1)
+                    if _rdp > 1:
+                        cfg_parts.append(f"rerank_batch={cfg['batch']}  dp={_rdp}")
+                    else:
+                        cfg_parts.append(f"rerank_batch={cfg['batch']}")
+                if "concurrent_batch" in cfg:
+                    cb = cfg['concurrent_batch']
+                    dp = cfg.get('dp', 1)
+                    if dp > 1:
+                        cfg_parts.append(f"concurrent_batch={cb}  dp={dp}  per_server={cb // dp}")
+                    else:
+                        cfg_parts.append(f"concurrent_batch={cb}")
+                if cfg_parts:
+                    print(f"      [{', '.join(cfg_parts)}]")
         print()
 
     def _start_ingestion_timer(self):
@@ -225,6 +291,11 @@ class RagDB(abc.ABC):
 
         passage_data = payload.get('passages', [])
 
+        max_passages = kwargs.pop('max_passages', None)
+        if max_passages is not None:
+            passage_data = passage_data[:max_passages]
+            print(f"  (limited to first {max_passages} passages via --max_passages)")
+
         doc_list = []
         passage_metadata = []
         for entry in passage_data:
@@ -258,7 +329,16 @@ class RagDB(abc.ABC):
 
         GPU (XPU): YES — cross-encoder inference runs on self._device.
         FAISS search is CPU-only for Intel XPU; this is the GPU-acceleratable part.
+
+        When NUMA-pinned reranking instances are registered, dispatches to them
+        even for single-query calls (instance 0 handles it; others stay idle).
         """
+        # Dispatch to instances when available (works even for single-query calls)
+        if self._reranking_instances:
+            results = self._rerank_with_instances([query], [passages],
+                                                  self._reranker_batch_size)
+            return results[0]
+
         if self._reranker_model is None:
             # If no reranker, return passages with dummy scores
             return [(p, 0.0) for p in passages]
@@ -279,6 +359,131 @@ class RagDB(abc.ABC):
 
         return self._time_op("reranking", _run)
     
+    def rerank_batch(self, queries: List[str], passages_list: List[List[str]], batch_size: int = 256):
+        """Batch rerank for multiple (query, passages) pairs.
+
+        Instead of N separate rerank() calls (one per query), collects all
+        (query, passage) pairs across all queries into a flat pool, processes
+        them in batches of batch_size forward passes, then reassembles
+        per-query scored lists.
+
+        For 256 queries × 10 passages = 2560 pairs @ batch_size=256:
+          → 10 forward passes instead of 256.
+
+        When NUMA-pinned reranking instances are registered via
+        set_reranking_instances(), the queries are split across instances and
+        processed in parallel, giving ~N× speedup on multi-NUMA hardware.
+
+        Returns:
+            List[List[Tuple[str, float]]] — one scored+sorted list per query,
+            same format as rerank().
+        """
+        if self._reranker_model is None and not self._reranking_instances:
+            return [[(p, 0.0) for p in passages] for passages in passages_list]
+
+        # Dispatch to NUMA-pinned parallel workers when available
+        if self._reranking_instances:
+            return self._rerank_with_instances(queries, passages_list, batch_size)
+
+        import torch
+
+        # Build flat list of (query, passage) pairs, tracking per-query offsets
+        flat_pairs = []
+        offsets = []  # (start_idx, length) per query
+        for query, passages in zip(queries, passages_list):
+            offsets.append((len(flat_pairs), len(passages)))
+            for passage in passages:
+                flat_pairs.append([query, passage])
+
+        n_queries = len(queries)
+        n_pairs = len(flat_pairs)
+
+        def _run_batch():
+            all_scores = []
+            for start in range(0, n_pairs, batch_size):
+                chunk = flat_pairs[start:start + batch_size]
+                with torch.no_grad():
+                    inputs = self._reranker_tokenizer(
+                        chunk, padding=True, return_tensors='pt',
+                        truncation=True, max_length=512
+                    )
+                    inputs = {k: v.to(self._device) for k, v in inputs.items()}
+                    chunk_scores = self._reranker_model(**inputs).logits.view(-1).float()
+                all_scores.extend(chunk_scores.cpu().tolist())
+            return all_scores
+
+        all_scores = self._time_op_batch("reranking", _run_batch, n_queries)
+
+        # Reassemble per-query scored+sorted lists
+        results = []
+        for (start, length), passages in zip(offsets, passages_list):
+            query_scores = all_scores[start:start + length]
+            scored = list(zip(passages, query_scores))
+            scored.sort(key=lambda x: x[1], reverse=True)
+            results.append(scored)
+        return results
+
+    def set_reranking_instances(self, instances: list):
+        """Register pre-started RerankInstance workers for parallel reranking.
+
+        When set, rerank_batch() will distribute queries across these workers
+        instead of running all forward passes in the main process.
+        Each worker must already be started (inst.start() called) before
+        passing them here.
+        """
+        self._reranking_instances = instances if instances else None
+        if instances:
+            print(f"Using {len(instances)} pre-started NUMA-pinned reranking instance(s)",
+                  flush=True)
+
+    def _rerank_with_instances(self, queries: List[str], passages_list: List[List[str]],
+                               batch_size: int) -> List[List]:
+        """Distribute reranking across pre-started RerankInstance workers.
+
+        Splits queries into N equal chunks (one per worker), sends them all
+        asynchronously, then collects results in query order.
+        """
+        import time as _time
+        instances = self._reranking_instances
+        n = len(instances)
+        n_queries = len(queries)
+        chunk_size = (n_queries + n - 1) // n
+
+        t0 = _time.perf_counter()
+
+        # Send all chunks to their respective workers (non-blocking)
+        actual_chunks = 0
+        for i, inst in enumerate(instances):
+            s = i * chunk_size
+            e = min(s + chunk_size, n_queries)
+            if s >= n_queries:
+                break
+            inst.rerank_async(i, queries[s:e], passages_list[s:e])
+            print(f"  [rerank_instance {i}] sent {e - s} queries", flush=True)
+            actual_chunks += 1
+
+        # Collect results — each call blocks on that specific worker finishing
+        collected = {}
+        for i in range(actual_chunks):
+            chunk_id, chunk_results = instances[i].get_result()
+            collected[chunk_id] = chunk_results
+            print(f"  [rerank_instance {chunk_id}] result received: "
+                  f"{len(chunk_results)} scored lists", flush=True)
+
+        # Reassemble in query order
+        all_results = []
+        for i in range(actual_chunks):
+            all_results.extend(collected[i])
+
+        # Record timing using _time_op_batch semantics (per-query latency × n_queries)
+        total = _time.perf_counter() - t0
+        if self._benchmark:
+            per_item = total / max(n_queries, 1)
+            timings = self._retrieval_timings.setdefault("reranking", [])
+            timings.extend([per_item] * n_queries)
+
+        return all_results
+
     def lookup_with_rerank(self, query: str, k: int, rerank_k: int = None) -> List[Any]:
         """Retrieve and rerank passages."""
         if rerank_k is None:

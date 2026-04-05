@@ -124,6 +124,15 @@ COMMON_PARAMS = [
         applies_to=["both"]
     ),
     ParamDef(
+        name="max_passages",
+        arg_names=["--max_passages"],
+        type=int,
+        default=None,
+        help="Limit ingestion to the first N passages (default: all). Useful for quick profiling runs.",
+        category="common",
+        applies_to=["both"]
+    ),
+    ParamDef(
         name="database",
         arg_names=["--database", "--db"],
         type=str,
@@ -157,6 +166,16 @@ COMMON_PARAMS = [
         default=None,
         help="Run evaluation on dataset. Optionally specify number of queries to evaluate (e.g., --eval 100)",
         nargs="?",
+        category="common",
+        applies_to=["both"]
+    ),
+    ParamDef(
+        name="repeat",
+        arg_names=["--repeat"],
+        type=int,
+        default=1,
+        help="Repeat the evaluation dataset N times (e.g. --repeat 10 → 256×10=2560 queries). "
+             "All N copies are embedded, searched, and reranked independently to stress-test throughput.",
         category="common",
         applies_to=["both"]
     ),
@@ -255,6 +274,27 @@ COMMON_PARAMS = [
         category="common",
         applies_to=["both"]
     ),
+    ParamDef(
+        name="retrieval_cache_out",
+        arg_names=["--retrieval-cache-out"],
+        type=str,
+        default=None,
+        help="Save retrieval results (prompt, doc_entries, urls) to this JSON file after retrieval "
+             "and exit WITHOUT running LLM. Used for two-phase execution: "
+             "run retrieval on all cores, then start vLLM servers, then run --retrieval-cache-in.",
+        category="common",
+        applies_to=["both"]
+    ),
+    ParamDef(
+        name="retrieval_cache_in",
+        arg_names=["--retrieval-cache-in"],
+        type=str,
+        default=None,
+        help="Load pre-computed retrieval results from this JSON file and skip directly to LLM generation. "
+             "Paired with --retrieval-cache-out from a previous retrieval-only run.",
+        category="common",
+        applies_to=["both"]
+    ),
 ]
 
 # ============================================================================
@@ -273,6 +313,16 @@ GENERAL_PARAMS = [
         applies_to=["both"]
     ),
     ParamDef(
+        name="model_dtype",
+        arg_names=["--model_dtype"],
+        type=str,
+        default="bfloat16",
+        help="Precision for embedding and reranker models (bfloat16/float32)",
+        choices=["bfloat16", "float32", "float16"],
+        category="general",
+        applies_to=["both"]
+    ),
+    ParamDef(
         name="threads",
         arg_names=["--threads"],
         type=int,
@@ -285,7 +335,7 @@ GENERAL_PARAMS = [
         name="num_embedding_devices",
         arg_names=["--num_embedding_devices"],
         type=int,
-        default=2,
+        default=4,
         help="Number of devices to use for parallel embedding generation (supports XPU, CUDA, CPU)",
         category="general",
         applies_to=["vector"]
@@ -295,8 +345,18 @@ GENERAL_PARAMS = [
         arg_names=["--embedding_batch_size"],
         type=int,
         default=256,
-        help="Batch size for embedding inference (passages per GPU forward pass). "
-             "Larger values improve GPU utilization. Default: 256",
+        help="Batch size for ingestion embedding inference (passages per forward pass). "
+             "Larger values improve throughput. Default: 256",
+        category="general",
+        applies_to=["vector"]
+    ),
+    ParamDef(
+        name="query_embedding_batch_size",
+        arg_names=["--query_embedding_batch_size"],
+        type=int,
+        default=None,
+        help="Batch size for query embedding at retrieval time (default: same as --embedding_batch_size). "
+             "Lets you tune ingestion and query embedding batch sizes independently.",
         category="general",
         applies_to=["vector"]
     ),
@@ -373,6 +433,15 @@ GENERAL_PARAMS = [
         default=False,
         help="Generate LLM answer outputs and save them alongside retrieval results",
         action="store_true",
+        category="general",
+        applies_to=["both"]
+    ),
+    ParamDef(
+        name="llm_batch_size",
+        arg_names=["--llm_batch_size"],
+        type=int,
+        default=128,
+        help="Number of concurrent LLM requests to send in evaluation mode (default: 128 for peak vLLM throughput)",
         category="general",
         applies_to=["both"]
     ),
@@ -567,6 +636,15 @@ RERANKING_PARAMS = [
         category="reranking",
         applies_to=["both"],
         optuna_suggest={'type': 'int', 'min': 1, 'max': 50, 'step': 1}
+    ),
+    ParamDef(
+        name="reranker_batch_size",
+        arg_names=["--reranker_batch_size"],
+        type=int,
+        default=256,
+        help="Number of (query, passage) pairs per reranker forward pass (default: 256)",
+        category="reranking",
+        applies_to=["both"],
     ),
 ]
 

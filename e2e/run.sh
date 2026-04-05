@@ -1,0 +1,1 @@
+MODEL_PATH=/data/Meta-Llama-3.1-8B-Instruct-quantized.w8a8/ bash run_e2e_with_llm_cpu.sh &> cpu.log

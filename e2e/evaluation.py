@@ -88,7 +88,10 @@ def evaluate_retrieval_query(rag_db, query: str, expected_urls: List[str],
                          top_k_retriever: int = 50, top_k_reranking: int = 10,
                          verbose: bool = True, no_rerank: bool = False,
                          retrieval_strategy: str = "fixed_k", print_results: bool = False,
-                         return_results: bool = False, **strategy_params) -> Union[Dict[str, Any], Tuple[Dict[str, Any], List[Any]]]:
+                         return_results: bool = False,
+                         precomputed_results=None,
+                         precomputed_rerank=None,
+                         **strategy_params) -> Union[Dict[str, Any], Tuple[Dict[str, Any], List[Any]]]:
     """
     Evaluate a single retrieval query and return comprehensive retrieval metrics.
     
@@ -101,6 +104,8 @@ def evaluate_retrieval_query(rag_db, query: str, expected_urls: List[str],
         verbose: Whether to print detailed results
         no_rerank: Skip reranking step for fair comparison between retrieval methods
         retrieval_strategy: Strategy for retrieval ("fixed_k", "top_p", "relative")
+        precomputed_results: Pre-retrieved results (from lookup_batch). When provided,
+            the retrieval step is skipped and these results are used directly.
         **strategy_params: Parameters for adaptive retrieval strategies
         
     Returns:
@@ -108,9 +113,11 @@ def evaluate_retrieval_query(rag_db, query: str, expected_urls: List[str],
     """
     import time
     
-    # Step 1: Time the initial retrieval
+    # Step 1: Time the initial retrieval (or use precomputed results from batch lookup)
     retrieval_start = time.perf_counter()
-    if retrieval_strategy == "fixed_k":
+    if precomputed_results is not None:
+        results = precomputed_results
+    elif retrieval_strategy == "fixed_k":
         results = rag_db.lookup(query, k=top_k_retriever)
     else:
         from retrieve.filter import filter
@@ -130,7 +137,11 @@ def evaluate_retrieval_query(rag_db, query: str, expected_urls: List[str],
             reranking_start = time.perf_counter()
             # Extract text content for reranking (rerank expects strings)
             passages = [result.page_content for result in results]
-            scored_passages = rag_db.rerank(query, passages)
+            # Use precomputed batch rerank results if available, else fall back to per-query rerank
+            if precomputed_rerank is not None:
+                scored_passages = precomputed_rerank
+            else:
+                scored_passages = rag_db.rerank(query, passages)
             
             # Reconstruct document objects with reranked order
             # scored_passages is [(text, score), ...] ordered by score
@@ -258,6 +269,7 @@ def run_evaluation(rag_db, dataset_path: str,
                                retrieval_strategy: str = "fixed_k", detailed_analysis: bool = False,
                                difficulty: int = 0, collect_results: bool = False,
                                result_handler: Optional[Callable[[str, List[Any], Dict[str, Any]], Optional[Any]]] = None,
+                               repeat: int = 1,
                                **strategy_params) -> Union[Dict[str, float], Tuple[Dict[str, float], List[Dict[str, Any]]]]:
     """
     Run comprehensive evaluation on a dataset with detailed metrics reporting.
@@ -284,6 +296,11 @@ def run_evaluation(rag_db, dataset_path: str,
     # Filter by difficulty if specified
     df = filter_dataset_by_difficulty(df, difficulty)
     
+    # Repeat dataset N times for throughput/LLM stress testing (e.g. repeat=10 → 256×10=2560 queries)
+    if repeat > 1:
+        df = pd.concat([df] * repeat, ignore_index=True)
+        print(f"Repeating dataset {repeat}\u00d7 \u2192 {len(df)} total queries")
+
     # Limit number of queries if specified
     if isinstance(max_queries, int) and max_queries > 0:
         df = df.head(max_queries)
@@ -291,7 +308,66 @@ def run_evaluation(rag_db, dataset_path: str,
         max_queries = len(df)
 
     print(f"\nRunning evaluation on {max_queries} queries from dataset")
-    
+
+    # Pre-batch query embeddings + FAISS searches when possible.
+    # This replaces 256 individual embed_query + FAISS calls with one
+    # embed_documents call and one vectorised index.search.
+    # Only supported for fixed_k strategy with a VectorDB that has lookup_batch.
+    precomputed_batch = None
+    use_batch = (
+        retrieval_strategy == "fixed_k"
+        and hasattr(rag_db, "lookup_batch")
+    )
+    if use_batch:
+        valid_rows = [
+            row for _, row in df.iterrows()
+            if any(
+                str(row.get(col, "")).startswith("http")
+                for col in df.columns if col.startswith("wikipedia_link_")
+            )
+        ]
+        batch_queries = [row["Prompt"] for row in valid_rows]
+        if batch_queries:
+            print(f"Pre-computing embeddings + FAISS for {len(batch_queries)} queries "
+                  f"(embedding batch={getattr(rag_db, '_embedding_batch_size', '?')})...")
+            batch_results = rag_db.lookup_batch(batch_queries, k=top_k_retriever)
+            # Store as positional list (same order as valid_rows) so repeated prompts
+            # each get their own embedding/FAISS result — needed for repeat>1 throughput testing.
+            precomputed_batch = list(batch_results)
+
+    # Pre-batch reranking for all queries when possible.
+    # Collects all (query, passages) pairs and runs them through the cross-encoder
+    # in batches of reranker_batch_size, replacing 256 per-query forward passes
+    # with ceil(256*k / reranker_batch_size) forward passes.
+    precomputed_rerank_batch = None
+    reranker_batch_size = getattr(rag_db, '_reranker_batch_size', 256)
+    use_rerank_batch = (
+        use_batch
+        and precomputed_batch is not None
+        and not no_rerank
+        and hasattr(rag_db, 'rerank_batch')
+        and (
+            (hasattr(rag_db, '_reranker_model') and rag_db._reranker_model is not None)
+            or (hasattr(rag_db, '_reranking_instances') and bool(rag_db._reranking_instances))
+        )
+    )
+    if use_rerank_batch:
+        # precomputed_batch is a positional list — zip directly with valid_rows
+        batch_passages_list = [
+            [doc.page_content for doc in results]
+            for results in precomputed_batch
+        ]
+        if batch_passages_list:
+            print(f"Pre-computing reranking for {len(valid_rows)} queries "
+                  f"(reranker batch={reranker_batch_size}, "
+                  f"{len(valid_rows) * top_k_retriever} pairs total)...")
+            batch_rerank_results = rag_db.rerank_batch(
+                [row["Prompt"] for row in valid_rows],
+                batch_passages_list,
+                batch_size=reranker_batch_size,
+            )
+            precomputed_rerank_batch = list(batch_rerank_results)
+
     # Aggregate metrics collection
     total_metrics = {}
     all_query_metrics = []  # Store individual query metrics for detailed analysis
@@ -301,7 +377,8 @@ def run_evaluation(rag_db, dataset_path: str,
     docs_per_sec_list = []
     collected_queries = [] if collect_results else None
     valid_queries = 0
-    
+    _batch_idx = 0  # positional index into precomputed_batch / precomputed_rerank_batch lists
+
     for idx, row in df.iterrows():
         # Extract expected Wikipedia links
         expected_urls = []
@@ -316,6 +393,8 @@ def run_evaluation(rag_db, dataset_path: str,
                 rag_db, row['Prompt'], expected_urls, 
                 top_k_retriever, top_k_reranking, verbose=True, no_rerank=no_rerank,
                 retrieval_strategy=retrieval_strategy, return_results=need_results,
+                precomputed_results=precomputed_batch[_batch_idx] if precomputed_batch is not None else None,
+                precomputed_rerank=precomputed_rerank_batch[_batch_idx] if precomputed_rerank_batch is not None else None,
                 **strategy_params
             )
             if need_results:
@@ -372,6 +451,7 @@ def run_evaluation(rag_db, dataset_path: str,
                 total_metrics[metric_name] += value
             
             valid_queries += 1
+            _batch_idx += 1
     
     if valid_queries > 0:
         # Calculate average metrics
